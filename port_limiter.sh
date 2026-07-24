@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # ====================================================
-# Nftables 端口限速交互式管理脚本 (全功能持久化版)
-# 特性: IPv4/IPv6双栈、防TCP断流、Docker兼容、开机自启
+# Nftables 端口限速交互式管理脚本 (全功能内存兼容版)
+# 核心特性: 完美支持 bash <(curl...) 一键执行及开机自启
 # ====================================================
 
 RED='\033[0;31m'
@@ -11,11 +11,13 @@ YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-# 恢复硬盘存储路径以支持开机自启读取
 WORK_DIR="/etc/port_limiter"
 RULE_FILE="${WORK_DIR}/rules.conf"
 SCRIPT_PATH="${WORK_DIR}/port_limiter.sh"
 SERVICE_FILE="/etc/systemd/system/port-limiter.service"
+
+# GitHub 脚本直链 (用于内存执行时的自我固化)
+REMOTE_URL="https://raw.githubusercontent.com/otaku-say/port_limiter/refs/heads/main/port_limiter.sh"
 
 if [ "$EUID" -ne 0 ]; then
   echo -e "${RED}错误：请使用 root 权限运行。${NC}"
@@ -26,7 +28,6 @@ check_env() {
     local run_mode=$1
     if ! command -v nft &> /dev/null; then
         if [ "$run_mode" == "boot" ]; then
-            # 避免开机时无网络导致 apt 卡死
             echo "Nftables not found during boot. Exiting."
             exit 1
         fi
@@ -38,10 +39,17 @@ check_env() {
     mkdir -p "$WORK_DIR"
     touch "$RULE_FILE"
     
-    # 自动将脚本复制到工作目录，供 Systemd 后台调用
-    if [ "$(realpath "$0")" != "$SCRIPT_PATH" ]; then
-        cp "$0" "$SCRIPT_PATH"
-        chmod +x "$SCRIPT_PATH"
+    # 核心黑科技：自我感知与固化逻辑
+    if [ "$(realpath "$0" 2>/dev/null)" != "$SCRIPT_PATH" ]; then
+        # 如果 $0 是 bash 或包含 /dev/fd/，说明是通过 bash <(curl...) 在内存中运行
+        if [[ "$0" == *"bash"* ]] || [[ "$0" == *"/dev/fd/"* ]] || [ ! -f "$0" ]; then
+            curl -sL "$REMOTE_URL" -o "$SCRIPT_PATH"
+            chmod +x "$SCRIPT_PATH"
+        else
+            # 普通的本地实体文件运行，直接复制
+            cp "$0" "$SCRIPT_PATH"
+            chmod +x "$SCRIPT_PATH"
+        fi
     fi
 }
 
@@ -76,7 +84,6 @@ apply_rules() {
     nft add chain inet port_limiter output '{ type filter hook output priority 0; policy accept; }'
     nft add chain inet port_limiter forward '{ type filter hook forward priority 0; policy accept; }'
 
-    # 无条件放行纯 TCP 控制帧 (防断网核心优化)
     local chains=("input" "output" "forward")
     for chain in "${chains[@]}"; do
         nft add rule inet port_limiter $chain tcp flags \& \(fin\|syn\|rst\|ack\) == ack meta length \< 100 accept
@@ -192,7 +199,6 @@ menu_status() {
     fi
 }
 
-# 命令行参数调度器 (供 Systemd 使用)
 if [ "$1" == "apply" ]; then
     check_env "$2"
     apply_rules
@@ -202,7 +208,6 @@ elif [ "$1" == "stop" ]; then
     exit 0
 fi
 
-# ================= 交互主菜单 =================
 check_env "interactive"
 deploy_service
 
@@ -222,7 +227,6 @@ while true; do
     echo "=============================================="
     read -p "请输入数字或直接粘贴 10 位 ID 删除: " choice
 
-    # 智能防呆识别
     if [[ "$choice" =~ ^[0-9]{10}$ ]]; then
         echo -e "\n${YELLOW}💡 智能识别：检测到您直接输入了规则 ID，正在为您执行删除...${NC}"
         if grep -q "^${choice}|" "$RULE_FILE" 2>/dev/null; then
@@ -244,7 +248,7 @@ while true; do
         6) menu_status ;;
         7) 
             systemctl enable port-limiter.service
-            echo -e "${GREEN}✅ 已设置开机自启。下次重启服务器后规则将自动生效。${NC}" 
+            echo -e "${GREEN}✅ 已设置开机自启。${NC}" 
             ;;
         8) 
             systemctl disable port-limiter.service

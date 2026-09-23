@@ -2,7 +2,7 @@
 # ==============================================================================
 # 作者: ainigost
 # 创建时间: 2026-09-23
-# 功能简述: 动态解析并批量放行 IPv4/IPv6 的 TCP/UDP 端口；支持 socat 分别代理 TCP 和 UDP 的 IPv6 流量至本地 IPv4
+# 功能简述: 动态解析放行 IPv4/IPv6 端口；增加去重逻辑与稳定的 socat 隧道保护
 # ==============================================================================
 
 # ----------------------------- 变量配置区 -----------------------------
@@ -20,46 +20,46 @@ SOCAT_TCP6_TO_IPV4="8443,4200"
 SOCAT_UDP6_TO_IPV4=""
 # ----------------------------------------------------------------------
 
-# 统一处理端口放行逻辑
-# 业务含义: 根据传入的 IP 版本、协议及端口字符串进行解析，将用户习惯的短横线区间语法转换为底层内核防火墙所需的冒号语法，并置入 INPUT 链首位以优先放行。
 apply_rules() {
     local ip_version="$1"
     local protocol="$2"
     local ports="$3"
     
-    if [ -z "$ports" ]; then
-        return
-    fi
+    [ -z "$ports" ] && return
     
     local cmd="iptables"
-    if [ "$ip_version" = "6" ]; then
-        cmd="ip6tables"
-    fi
+    [ "$ip_version" = "6" ] && cmd="ip6tables"
     
     for port in $(echo "$ports" | tr ',' ' '); do
         local formatted_port=$(echo "$port" | tr '-' ':')
+        
+        # 核心优化：先尝试静默删除旧规则，防止重复触发时规则无限堆叠
+        $cmd -D INPUT -p "$protocol" --dport "$formatted_port" -j ACCEPT 2>/dev/null
+        
+        # 再插入新规则到首位
         $cmd -I INPUT -p "$protocol" --dport "$formatted_port" -j ACCEPT
     done
 }
 
-# 依次执行各维度规则的下发
 apply_rules "4" "tcp" "$IPV4_PORT_TCP"
 apply_rules "4" "udp" "$IPV4_PORT_UDP"
 apply_rules "6" "tcp" "$IPV6_PORT_TCP"
 apply_rules "6" "udp" "$IPV6_PORT_UDP"
 
-# 建立 IPv6 到 IPv4 的转换隧道
-# 业务含义: 自动清理存量隧道以避免防火墙重载时产生端口冲突，根据配置分别启动 TCP 和 UDP 协议的独立代理进程，在 :: 建立监听并将流量路由回 127.0.0.1。
+# ----------------------------------------------------------------------
+# 隧道保活修复逻辑
+# 杀掉旧隧道后，强制等待 1 秒钟让内核完全释放端口，再使用 nohup 脱离父进程绑定运行
 killall socat 2>/dev/null
+sleep 1
 
 if [ -n "$SOCAT_TCP6_TO_IPV4" ]; then
     for tunnel_port in $(echo "$SOCAT_TCP6_TO_IPV4" | tr ',' ' '); do
-        socat TCP6-LISTEN:"$tunnel_port",ipv6only=1,reuseaddr,fork TCP4:127.0.0.1:"$tunnel_port" &
+        nohup socat TCP6-LISTEN:"$tunnel_port",ipv6only=1,reuseaddr,fork TCP4:127.0.0.1:"$tunnel_port" >/dev/null 2>&1 &
     done
 fi
 
 if [ -n "$SOCAT_UDP6_TO_IPV4" ]; then
     for tunnel_port in $(echo "$SOCAT_UDP6_TO_IPV4" | tr ',' ' '); do
-        socat UDP6-LISTEN:"$tunnel_port",ipv6only=1,reuseaddr,fork UDP4:127.0.0.1:"$tunnel_port" &
+        nohup socat UDP6-LISTEN:"$tunnel_port",ipv6only=1,reuseaddr,fork UDP4:127.0.0.1:"$tunnel_port" >/dev/null 2>&1 &
     done
 fi

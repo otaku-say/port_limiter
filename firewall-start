@@ -16,7 +16,7 @@ IPV6_PORT_UDP=""
 
 # IPv6 到 IPv4 的端口转发隧道 (针对缺乏原生 IPv6 监听的本地服务)
 # 填写需要代理的端口号，多个用逗号分隔，留空则不启用该协议的隧道
-SOCAT_TCP6_TO_IPV4="8443,4200"
+SOCAT_TCP6_TO_IPV4="4200"
 SOCAT_UDP6_TO_IPV4=""
 # ----------------------------------------------------------------------
 
@@ -32,11 +32,9 @@ apply_rules() {
     
     for port in $(echo "$ports" | tr ',' ' '); do
         local formatted_port=$(echo "$port" | tr '-' ':')
-        
-        # 核心优化：先尝试静默删除旧规则，防止重复触发时规则无限堆叠
+        # 防堆叠：静默删除历史规则
         $cmd -D INPUT -p "$protocol" --dport "$formatted_port" -j ACCEPT 2>/dev/null
-        
-        # 再插入新规则到首位
+        # 插入新规则
         $cmd -I INPUT -p "$protocol" --dport "$formatted_port" -j ACCEPT
     done
 }
@@ -47,19 +45,22 @@ apply_rules "6" "tcp" "$IPV6_PORT_TCP"
 apply_rules "6" "udp" "$IPV6_PORT_UDP"
 
 # ----------------------------------------------------------------------
-# 隧道保活修复逻辑
-# 杀掉旧隧道后，强制等待 1 秒钟让内核完全释放端口，再使用 nohup 脱离父进程绑定运行
-killall socat 2>/dev/null
-sleep 1
+# 智能进程保护守护逻辑
+# 检查当前端口是否已有对应的 socat 在运行，如果没有才启动，避免被防火墙重载机制误杀
 
 if [ -n "$SOCAT_TCP6_TO_IPV4" ]; then
     for tunnel_port in $(echo "$SOCAT_TCP6_TO_IPV4" | tr ',' ' '); do
-        nohup socat TCP6-LISTEN:"$tunnel_port",ipv6only=1,reuseaddr,fork TCP4:127.0.0.1:"$tunnel_port" >/dev/null 2>&1 &
+        # 仅当进程列表里找不到对应监听端口时，才执行拉起
+        if ! ps -w | grep -q "[s]ocat TCP6-LISTEN:${tunnel_port}"; then
+            nohup socat TCP6-LISTEN:"$tunnel_port",ipv6only=1,reuseaddr,fork TCP4:127.0.0.1:"$tunnel_port" >/dev/null 2>&1 &
+        fi
     done
 fi
 
 if [ -n "$SOCAT_UDP6_TO_IPV4" ]; then
     for tunnel_port in $(echo "$SOCAT_UDP6_TO_IPV4" | tr ',' ' '); do
-        nohup socat UDP6-LISTEN:"$tunnel_port",ipv6only=1,reuseaddr,fork UDP4:127.0.0.1:"$tunnel_port" >/dev/null 2>&1 &
+        if ! ps -w | grep -q "[s]ocat UDP6-LISTEN:${tunnel_port}"; then
+            nohup socat UDP6-LISTEN:"$tunnel_port",ipv6only=1,reuseaddr,fork UDP4:127.0.0.1:"$tunnel_port" >/dev/null 2>&1 &
+        fi
     done
 fi

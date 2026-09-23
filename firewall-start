@@ -2,36 +2,64 @@
 # ==============================================================================
 # 作者: ainigost
 # 创建时间: 2026-09-23
-# 功能简述: 动态解析并批量放行 IPv4 和 IPv6 外部访问路由器自身(INPUT链)的端口及区间
+# 功能简述: 动态解析并批量放行 IPv4/IPv6 的 TCP/UDP 端口；支持 socat 分别代理 TCP 和 UDP 的 IPv6 流量至本地 IPv4
 # ==============================================================================
 
 # ----------------------------- 变量配置区 -----------------------------
-# 需要放行的 IPv4 端口或区间 (多个使用英文逗号分隔，区间使用短横线)
-IPV4_PORT="8443,4200"
+# IPv4 放行配置 (支持单端口、多端口逗号分隔、端口区间短横线连接)
+IPV4_PORT_TCP="8443,4200"
+IPV4_PORT_UDP=""
 
-# 需要放行的 IPv6 端口或区间 (多个使用英文逗号分隔，区间使用短横线)
-IPV6_PORT="8443,4200"
+# IPv6 放行配置 (支持单端口、多端口逗号分隔、端口区间短横线连接)
+IPV6_PORT_TCP="8443,4200"
+IPV6_PORT_UDP=""
+
+# IPv6 到 IPv4 的端口转发隧道 (针对缺乏原生 IPv6 监听的本地服务)
+# 填写需要代理的端口号，多个用逗号分隔，留空则不启用该协议的隧道
+SOCAT_TCP6_TO_IPV4="8443,4200"
+SOCAT_UDP6_TO_IPV4=""
 # ----------------------------------------------------------------------
 
-# 放行 IPv4 端口逻辑
-if [ -n "$IPV4_PORT" ]; then
-    # 将逗号替换为空格进行遍历拆分
-    for port in $(echo "$IPV4_PORT" | tr ',' ' '); do
-        # 适配 iptables 的语法格式，将短横线转换为冒号以表示端口范围
-        formatted_port=$(echo "$port" | tr '-' ':')
-        
-        # 插入 TCP 和 UDP 允许规则至 INPUT 链首位
-        iptables -I INPUT -p tcp --dport "$formatted_port" -j ACCEPT
-        iptables -I INPUT -p udp --dport "$formatted_port" -j ACCEPT
+# 统一处理端口放行逻辑
+# 业务含义: 根据传入的 IP 版本、协议及端口字符串进行解析，将用户习惯的短横线区间语法转换为底层内核防火墙所需的冒号语法，并置入 INPUT 链首位以优先放行。
+apply_rules() {
+    local ip_version="$1"
+    local protocol="$2"
+    local ports="$3"
+    
+    if [ -z "$ports" ]; then
+        return
+    fi
+    
+    local cmd="iptables"
+    if [ "$ip_version" = "6" ]; then
+        cmd="ip6tables"
+    fi
+    
+    for port in $(echo "$ports" | tr ',' ' '); do
+        local formatted_port=$(echo "$port" | tr '-' ':')
+        $cmd -I INPUT -p "$protocol" --dport "$formatted_port" -j ACCEPT
+    done
+}
+
+# 依次执行各维度规则的下发
+apply_rules "4" "tcp" "$IPV4_PORT_TCP"
+apply_rules "4" "udp" "$IPV4_PORT_UDP"
+apply_rules "6" "tcp" "$IPV6_PORT_TCP"
+apply_rules "6" "udp" "$IPV6_PORT_UDP"
+
+# 建立 IPv6 到 IPv4 的转换隧道
+# 业务含义: 自动清理存量隧道以避免防火墙重载时产生端口冲突，根据配置分别启动 TCP 和 UDP 协议的独立代理进程，在 :: 建立监听并将流量路由回 127.0.0.1。
+killall socat 2>/dev/null
+
+if [ -n "$SOCAT_TCP6_TO_IPV4" ]; then
+    for tunnel_port in $(echo "$SOCAT_TCP6_TO_IPV4" | tr ',' ' '); do
+        socat TCP6-LISTEN:"$tunnel_port",ipv6only=1,reuseaddr,fork TCP4:127.0.0.1:"$tunnel_port" &
     done
 fi
 
-# 放行 IPv6 端口逻辑
-if [ -n "$IPV6_PORT" ]; then
-    for port in $(echo "$IPV6_PORT" | tr ',' ' '); do
-        formatted_port=$(echo "$port" | tr '-' ':')
-        
-        ip6tables -I INPUT -p tcp --dport "$formatted_port" -j ACCEPT
-        ip6tables -I INPUT -p udp --dport "$formatted_port" -j ACCEPT
+if [ -n "$SOCAT_UDP6_TO_IPV4" ]; then
+    for tunnel_port in $(echo "$SOCAT_UDP6_TO_IPV4" | tr ',' ' '); do
+        socat UDP6-LISTEN:"$tunnel_port",ipv6only=1,reuseaddr,fork UDP4:127.0.0.1:"$tunnel_port" &
     done
 fi

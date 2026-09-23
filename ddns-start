@@ -1,0 +1,155 @@
+#!/bin/sh
+# ==============================================================================
+# 作者: ainigost (Optimized)
+# 创建时间: 2026-09-23
+# 功能简述: 自动获取公网 IP 并调用 Cloudflare API 更新解析；优化了 API 交互与异常处理
+# ==============================================================================
+
+# ----------------------------- 变量配置区 -----------------------------
+# 需要解析的完整子域名
+DOMAIN="ddns.otakusay.cn"
+
+# Cloudflare 仪表盘中域名的区域 ID (Overview 页面右下角可查)
+ZONE_ID="302c2716ec18719180bfe5fc91240f05"
+
+# Cloudflare API 令牌 (需具备“区域 - DNS - 编辑”权限)
+CF_TOKEN="cfut_HdztKKTYXb07C9PApG9KgnlAOuhhnkGz74P49xvw3e558e96"
+
+# IP 设置: 留空不推送，填 "auto" 自动获取，也可直接填写固定 IP
+IPV4=""
+IPV6="auto"
+
+# 自动获取 IPv6 失败时，回退读取本地 IP 的网卡名称 (拨号通常为 ppp0，桥接通常为 br0)
+LOCAL_V6_IFACE="ppp0"
+
+# 获取 IP 的外部接口 (多个用英文逗号分隔)
+IPV4_URLS="https://api-ipv4.ip.sb/ip,https://v4.ident.me,https://ipv4.icanhazip.com"
+IPV6_URLS="https://api-ipv6.ip.sb/ip,https://v6.ident.me,https://ipv6.icanhazip.com"
+# ----------------------------------------------------------------------
+
+# 兼容空格的 JSON 值提取方法
+get_json_val() {
+    echo "$1" | sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -n 1
+}
+
+# 获取本地公网 IPv4
+fetch_ipv4() {
+    local ip=""
+    for url in $(echo "$IPV4_URLS" | tr ',' ' '); do
+        # 增加 --max-time 防止死连接卡死守护进程
+        ip=$(curl -s -4 -k --connect-timeout 5 --max-time 10 "$url" | tr -d '\r\n ')
+        if echo "$ip" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
+            echo "$ip"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# 获取本地公网 IPv6
+fetch_ipv6() {
+    local ip=""
+    for url in $(echo "$IPV6_URLS" | tr ',' ' '); do
+        ip=$(curl -s -6 -k --connect-timeout 5 --max-time 10 "$url" | tr -d '\r\n ')
+        if echo "$ip" | grep -Eq '^[0-9a-fA-F:]+$' && echo "$ip" | grep -q ':'; then
+            echo "$ip"
+            return 0
+        fi
+    done
+    
+    # 外部接口失效时，从本地指定网卡读取
+    ip=$(ip -6 addr show "$LOCAL_V6_IFACE" 2>/dev/null | grep "scope global" | grep -v "deprecated" | awk '{print $3}' | cut -d/ -f1 | head -n 1)
+    if [ -n "$ip" ]; then
+        echo "$ip"
+        return 0
+    fi
+    return 1
+}
+
+# 执行 Cloudflare DNS 更新
+update_record() {
+    local rec_type="$1"
+    local target_ip="$2"
+    local zone_id="$3"
+
+    # 查询记录 ID 与当前解析的 IP
+    local record_res=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records?name=${DOMAIN}&type=${rec_type}" \
+        -H "Authorization: Bearer ${CF_TOKEN}" \
+        -H "Content-Type: application/json" --max-time 10)
+
+    # 校验 API 是否请求成功
+    if ! echo "$record_res" | grep -q '"success":true'; then
+        logger -t custom_ddns "[$rec_type] 查询记录失败，可能 Token 无效或网络异常"
+        return 1
+    fi
+
+    local record_id=$(get_json_val "$record_res" "id")
+    local current_ip=$(get_json_val "$record_res" "content")
+
+    if [ "$current_ip" = "$target_ip" ]; then
+        logger -t custom_ddns "[$rec_type] 远端 IP ($current_ip) 未变更，跳过更新"
+        return 0
+    fi
+
+    local payload="{\"type\":\"${rec_type}\",\"name\":\"${DOMAIN}\",\"content\":\"${target_ip}\",\"ttl\":1,\"proxied\":false}"
+
+    if [ -n "$record_id" ]; then
+        # PUT 方法更新已有记录
+        local update_res=$(curl -s -X PUT "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records/${record_id}" \
+            -H "Authorization: Bearer ${CF_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data "$payload" --max-time 10)
+        
+        if echo "$update_res" | grep -q '"success":true'; then
+            logger -t custom_ddns "[$rec_type] 记录更新成功: $target_ip"
+        else
+            logger -t custom_ddns "[$rec_type] 记录更新失败: $update_res"
+            return 1
+        fi
+    else
+        # POST 方法创建新记录
+        local create_res=$(curl -s -X POST "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records" \
+            -H "Authorization: Bearer ${CF_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data "$payload" --max-time 10)
+        
+        if echo "$create_res" | grep -q '"success":true'; then
+            logger -t custom_ddns "[$rec_type] 记录创建成功: $target_ip"
+        else
+            logger -t custom_ddns "[$rec_type] 记录创建失败: $create_res"
+            return 1
+        fi
+    fi
+}
+
+logger -t custom_ddns "开始执行 Cloudflare DDNS 流程"
+
+if [ -z "$ZONE_ID" ]; then
+    logger -t custom_ddns "错误: 变量 ZONE_ID 未设置"
+    /sbin/ddns_custom_updated 0
+    exit 1
+fi
+
+if [ -n "$IPV4" ]; then
+    REAL_IPV4=$([ "$IPV4" = "auto" ] && fetch_ipv4 || echo "$IPV4")
+    if [ -n "$REAL_IPV4" ]; then
+        update_record "A" "$REAL_IPV4" "$ZONE_ID"
+    else
+        logger -t custom_ddns "[A] 无法获取有效的公网 IPv4"
+    fi
+else
+    logger -t custom_ddns "[A] 变量为空，跳过 IPv4"
+fi
+
+if [ -n "$IPV6" ]; then
+    REAL_IPV6=$([ "$IPV6" = "auto" ] && fetch_ipv6 || echo "$IPV6")
+    if [ -n "$REAL_IPV6" ]; then
+        update_record "AAAA" "$REAL_IPV6" "$ZONE_ID"
+    else
+        logger -t custom_ddns "[AAAA] 无法获取有效的公网 IPv6"
+    fi
+else
+    logger -t custom_ddns "[AAAA] 变量为空，跳过 IPv6"
+fi
+
+/sbin/ddns_custom_updated 1

@@ -2,65 +2,71 @@
 # ==============================================================================
 # 作者: ainigost
 # 创建时间: 2026-09-23
-# 功能简述: 动态解析放行 IPv4/IPv6 端口；增加去重逻辑与稳定的 socat 隧道保护
+# 功能简述: 动态解析并批量放行 IPv4/IPv6 端口；包含规则去重逻辑，防止重拨号导致规则堆叠
 # ==============================================================================
 
 # ----------------------------- 变量配置区 -----------------------------
-# IPv4 放行配置 (支持单端口、多端口逗号分隔、端口区间短横线连接)
+
+# 【IPv4 TCP 端口放行】
+# 允许外部网络通过 IPv4 访问路由器自身的 TCP 端口。
+# 填写示例：
+#   单端口放行: "80"
+#   多端口放行: "80,443,8443" (使用英文逗号分隔)
+#   端口段放行: "40000-50000" (使用短横线连接)
+#   混合式配置: "80,443,40000-50000"
+#   不放行留空: ""
 IPV4_PORT_TCP="8443,4200"
+
+# 【IPv4 UDP 端口放行】
+# 允许外部网络通过 IPv4 访问路由器自身的 UDP 端口。
+# 填写示例规则同上。
 IPV4_PORT_UDP=""
 
-# IPv6 放行配置 (支持单端口、多端口逗号分隔、端口区间短横线连接)
+# 【IPv6 TCP 端口放行】
+# 允许外部网络通过 IPv6 访问路由器自身的 TCP 端口。
+# 填写示例: "8443,4200,10000-20000"
 IPV6_PORT_TCP="8443,4200"
+
+# 【IPv6 UDP 端口放行】
+# 允许外部网络通过 IPv6 访问路由器自身的 UDP 端口。
+# 填写示例: "10000-20000"
 IPV6_PORT_UDP=""
 
-# IPv6 到 IPv4 的端口转发隧道 (针对缺乏原生 IPv6 监听的本地服务)
-# 填写需要代理的端口号，多个用逗号分隔，留空则不启用该协议的隧道
-SOCAT_TCP6_TO_IPV4="4200"
-SOCAT_UDP6_TO_IPV4=""
 # ----------------------------------------------------------------------
 
+# 统一处理端口放行逻辑
 apply_rules() {
     local ip_version="$1"
     local protocol="$2"
     local ports="$3"
     
-    [ -z "$ports" ] && return
+    # 如果变量为空，则直接跳过不执行
+    if [ -z "$ports" ]; then
+        return
+    fi
     
+    # 根据传入的 IP 版本选择相应的内核防火墙命令
     local cmd="iptables"
-    [ "$ip_version" = "6" ] && cmd="ip6tables"
+    if [ "$ip_version" = "6" ]; then
+        cmd="ip6tables"
+    fi
     
+    # 遍历处理以逗号分隔的每一个端口或端口段
     for port in $(echo "$ports" | tr ',' ' '); do
+        # 转换我们易读的短横线("-")为底层 iptables 能识别的冒号(":")区间格式
         local formatted_port=$(echo "$port" | tr '-' ':')
-        # 防堆叠：静默删除历史规则
+        
+        # 核心防堆叠逻辑：
+        # 先尝试静默删除旧规则 (2>/dev/null 屏蔽报错)，防止网络波动重复触发脚本导致规则无限堆叠
         $cmd -D INPUT -p "$protocol" --dport "$formatted_port" -j ACCEPT 2>/dev/null
-        # 插入新规则
+        
+        # 然后将新规则插入到入站 (INPUT) 链的最高优先级首位
         $cmd -I INPUT -p "$protocol" --dport "$formatted_port" -j ACCEPT
     done
 }
 
+# 依次执行各维度规则的下发
 apply_rules "4" "tcp" "$IPV4_PORT_TCP"
 apply_rules "4" "udp" "$IPV4_PORT_UDP"
 apply_rules "6" "tcp" "$IPV6_PORT_TCP"
 apply_rules "6" "udp" "$IPV6_PORT_UDP"
-
-# ----------------------------------------------------------------------
-# 智能进程保护守护逻辑
-# 检查当前端口是否已有对应的 socat 在运行，如果没有才启动，避免被防火墙重载机制误杀
-
-if [ -n "$SOCAT_TCP6_TO_IPV4" ]; then
-    for tunnel_port in $(echo "$SOCAT_TCP6_TO_IPV4" | tr ',' ' '); do
-        # 仅当进程列表里找不到对应监听端口时，才执行拉起
-        if ! ps -w | grep -q "[s]ocat TCP6-LISTEN:${tunnel_port}"; then
-            nohup socat TCP6-LISTEN:"$tunnel_port",ipv6only=1,reuseaddr,fork TCP4:127.0.0.1:"$tunnel_port" >/dev/null 2>&1 &
-        fi
-    done
-fi
-
-if [ -n "$SOCAT_UDP6_TO_IPV4" ]; then
-    for tunnel_port in $(echo "$SOCAT_UDP6_TO_IPV4" | tr ',' ' '); do
-        if ! ps -w | grep -q "[s]ocat UDP6-LISTEN:${tunnel_port}"; then
-            nohup socat UDP6-LISTEN:"$tunnel_port",ipv6only=1,reuseaddr,fork UDP4:127.0.0.1:"$tunnel_port" >/dev/null 2>&1 &
-        fi
-    done
-fi

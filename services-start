@@ -1,22 +1,38 @@
+cat << 'EOF' > /jffs/scripts/services-start
 #!/bin/sh
 # ==============================================================================
 # 作者: ainigost
 # 创建时间: 2026-09-24
-# 功能简述: 后台常驻守护 socat 进程，桥接公网 IPv6 4200 端口至本地 IPv4 4200 终端服务
+# 功能简述: 启动 IPv6 4200 端口转发常驻进程，并注册系统定时巡检任务实现高可用保活
 # ==============================================================================
 
-# 导入系统与 Entware 环境变量路径
+# 导入必要路径，确保能调用 /opt/bin 下的工具
 export PATH=/opt/bin:/opt/sbin:/sbin:/bin:/usr/sbin:/usr/bin:$PATH
 
-# 终止残留的历史转发进程
+# 1. 杀死残留的旧进程与旧看门狗
 killall socat 2>/dev/null
+killall socat-watchdog.sh 2>/dev/null
 
-# 启动后台看门狗守护循环
-nohup sh -c '
-    while true; do
-        # 监听外部 IPv6 4200 端口并仅绑定 IPv6 栈，转发至本地环回地址 127.0.0.1:4200
+# 2. 创建独立的看门狗守护脚本文件
+cat << 'DOG' > /tmp/socat-watchdog.sh
+#!/bin/sh
+# 业务含义: 当 socat 进程因异常请求或网络抖动退出时，延时 2 秒自动重启
+while true; do
+    if ! pidof socat >/dev/null 2>&1; then
         /opt/bin/socat TCP6-LISTEN:4200,reuseaddr,fork,ipv6only TCP4:127.0.0.1:4200
-        # 异常断开时休眠 2 秒后自动重新拉起
-        sleep 2
-    done
-' >/dev/null 2>&1 &
+    fi
+    sleep 2
+done
+DOG
+chmod +x /tmp/socat-watchdog.sh
+
+# 3. 使用 nohup 脱离当前控制终端并在后台启动看门狗
+nohup /tmp/socat-watchdog.sh >/dev/null 2>&1 &
+
+# 4. 第二重保险: 利用梅林 cru 机制每 2 分钟巡检一次进程，挂掉则重新拉起
+cru a SocatWatchdog "*/2 * * * * /bin/sh -c 'pidof socat >/dev/null || (/tmp/socat-watchdog.sh >/dev/null 2>&1 &)'"
+EOF
+
+# 赋予执行权限并立即运行
+chmod +x /jffs/scripts/services-start
+/jffs/scripts/services-start

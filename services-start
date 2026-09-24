@@ -1,4 +1,3 @@
-cat << 'EOF' > /jffs/scripts/services-start
 #!/bin/sh
 # ==============================================================================
 # 作者: ainigost
@@ -31,8 +30,4 @@ nohup /tmp/socat-watchdog.sh >/dev/null 2>&1 &
 
 # 4. 第二重保险: 利用梅林 cru 机制每 2 分钟巡检一次进程，挂掉则重新拉起
 cru a SocatWatchdog "*/2 * * * * /bin/sh -c 'pidof socat >/dev/null || (/tmp/socat-watchdog.sh >/dev/null 2>&1 &)'"
-EOF
 
-# 赋予执行权限并立即运行
-chmod +x /jffs/scripts/services-start
-/jffs/scripts/services-start

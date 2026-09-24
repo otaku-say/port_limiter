@@ -2,20 +2,21 @@
 # ==============================================================================
 # 作者: ainigost
 # 创建时间: 2026-09-24
-# 功能简述: 后台常驻守护 socat 进程，实现公网 IPv6 4200 端口转发到路由器本地 4200 端口
+# 功能简述: 后台常驻守护 socat 进程，桥接公网 IPv6 4200 端口至本地 IPv4 4200 终端服务
 # ==============================================================================
 
-# 终止残留的历史 socat 转发进程，避免端口冲突
+# 导入系统与 Entware 环境变量路径
+export PATH=/opt/bin:/opt/sbin:/sbin:/bin:/usr/sbin:/usr/bin:$PATH
+
+# 终止残留的历史转发进程
 killall socat 2>/dev/null
 
 # 启动后台看门狗守护循环
-# 使用 nohup 忽略终端挂断信号 (SIGHUP)，确保退出 SSH 后转发依然稳定常驻
 nohup sh -c '
     while true; do
-        # 监听公网 IPv6 4200 端口，中继至路由器自身 IPv4 4200 端口
-        # reuseaddr 允许端口快速重用，fork 允许处理多个并发连接
-        socat TCP6-LISTEN:4200,reuseaddr,fork TCP4:192.168.50.1:4200
-        # 若 socat 遭遇异常连接退出，休眠 2 秒后自动重新拉起，防止高频空转占用 CPU
+        # 监听外部 IPv6 4200 端口并仅绑定 IPv6 栈，转发至本地环回地址 127.0.0.1:4200
+        /opt/bin/socat TCP6-LISTEN:4200,reuseaddr,fork,ipv6only TCP4:127.0.0.1:4200
+        # 异常断开时休眠 2 秒后自动重新拉起
         sleep 2
     done
 ' >/dev/null 2>&1 &

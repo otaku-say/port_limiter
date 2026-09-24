@@ -1,23 +1,21 @@
 #!/bin/sh
+# ==============================================================================
 # 作者: ainigost
 # 创建时间: 2026-09-24
-# 功能简述: 双通道后台看门狗守护，确保 Web 后台与终端的 IPv6 中继服务持续稳定运行
+# 功能简述: 后台常驻守护 socat 进程，实现公网 IPv6 4200 端口转发到路由器本地 4200 端口
+# ==============================================================================
 
-# 结束历史残留进程
+# 终止残留的历史 socat 转发进程，避免端口冲突
 killall socat 2>/dev/null
 
-# 启动 Web 后台中继守护 (IPv6:8443 -> IPv4:8443)
-(
+# 启动后台看门狗守护循环
+# 使用 nohup 忽略终端挂断信号 (SIGHUP)，确保退出 SSH 后转发依然稳定常驻
+nohup sh -c '
     while true; do
-        socat TCP6-LISTEN:8443,reuseaddr,fork TCP4:192.168.50.1:8443 >/dev/null 2>&1
+        # 监听公网 IPv6 4200 端口，中继至路由器自身 IPv4 4200 端口
+        # reuseaddr 允许端口快速重用，fork 允许处理多个并发连接
+        socat TCP6-LISTEN:4200,reuseaddr,fork TCP4:192.168.50.1:4200
+        # 若 socat 遭遇异常连接退出，休眠 2 秒后自动重新拉起，防止高频空转占用 CPU
         sleep 2
     done
-) &
-
-# 启动 Web Shell 终端中继守护 (IPv6:4200 -> IPv4:4200)
-(
-    while true; do
-        socat TCP6-LISTEN:4200,reuseaddr,fork TCP4:192.168.50.1:4200 >/dev/null 2>&1
-        sleep 2
-    done
-) &
+' >/dev/null 2>&1 &

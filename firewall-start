@@ -1,8 +1,8 @@
 #!/bin/sh
 # ==============================================================================
 # 作者: ainigost
-# 创建时间: 2026-09-23
-# 功能简述: 动态解析并批量放行 IPv4/IPv6 端口；包含规则去重逻辑，防止重拨号导致规则堆叠
+# 创建时间: 2026-09-24
+# 功能简述: 动态解析并批量放行 IPv4/IPv6 端口；包含规则去重逻辑与 IPv6 TCPMSS 自动钳制优化
 # ==============================================================================
 
 # ----------------------------- 变量配置区 -----------------------------
@@ -53,14 +53,14 @@ apply_rules() {
     
     # 遍历处理以逗号分隔的每一个端口或端口段
     for port in $(echo "$ports" | tr ',' ' '); do
-        # 转换我们易读的短横线("-")为底层 iptables 能识别的冒号(":")区间格式
+        # 转换短横线("-")为底层 iptables 能识别的冒号(":")区间格式
         local formatted_port=$(echo "$port" | tr '-' ':')
         
         # 核心防堆叠逻辑：
-        # 先尝试静默删除旧规则 (2>/dev/null 屏蔽报错)，防止网络波动重复触发脚本导致规则无限堆叠
+        # 先尝试静默删除旧规则，防止网络波动重复触发脚本导致规则无限堆叠
         $cmd -D INPUT -p "$protocol" --dport "$formatted_port" -j ACCEPT 2>/dev/null
         
-        # 然后将新规则插入到入站 (INPUT) 链的最高优先级首位
+        # 将新规则插入到入站 (INPUT) 链的首位
         $cmd -I INPUT -p "$protocol" --dport "$formatted_port" -j ACCEPT
     done
 }
@@ -70,3 +70,10 @@ apply_rules "4" "tcp" "$IPV4_PORT_TCP"
 apply_rules "4" "udp" "$IPV4_PORT_UDP"
 apply_rules "6" "tcp" "$IPV6_PORT_TCP"
 apply_rules "6" "udp" "$IPV6_PORT_UDP"
+
+# -------------------------- 网络优化配置区 --------------------------
+
+# 自动钳制路由器本机向外发出的 IPv6 TCP MSS 大小
+# 避免数据包超出运营商 PPPoE MTU (通常为 1492) 导致分片丢失或页面加载缓慢
+ip6tables -t mangle -D OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null
+ip6tables -t mangle -A OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu

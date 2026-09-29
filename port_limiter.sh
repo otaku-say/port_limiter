@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==============================================================================
-#  port_limiter v4.0.0  —— 端口峰值带宽整形器（tc HTB + cake）
+#  port_limiter v4.0.1  —— 端口峰值带宽整形器（tc HTB + cake）
 #
 #  ★ 默认工作模式：自动跟踪（auto-tracking）
 #    规则里可以放心写一大段端口（如 40001-41111）：脚本只为「本机真正在监听」的
@@ -64,7 +64,7 @@
 # ==============================================================================
 set -uo pipefail
 
-VERSION="4.0.0"
+VERSION="4.0.1"
 WORK_DIR="${WORK_DIR:-/etc/port_limiter}"
 RULE_FILE="${RULE_FILE:-$WORK_DIR/rules.conf}"
 CONFIG_FILE="${CONFIG_FILE:-$WORK_DIR/config}"
@@ -445,15 +445,16 @@ apply_all() {
     sig="$( { cat "$specs"; echo "$iface|$TC_DIR|$TC_CAKE_OPTS|$TC_DEFAULT_RATE|$IFB_NAME|$PORT_SOURCE"; } | md5sum | cut -d' ' -f1)"
     stored="$(sed -n "s/^SIG='\([^']*\)'.*/\1/p" "$TC_STATE" 2>/dev/null | head -1)"
     if [ "${FORCE:-0}" != "1" ] && [ -n "$stored" ] && [ "$sig" = "$stored" ] && tc_qdisc_has "$iface" "qdisc htb 1:"; then
-        [ "${QUICK:-}" = "quick" ] || ok "配置与上次一致，跳过重建（如需强制重建：bash $0 apply force）"
+        # 只有「非交互」场景（systemd 定时器）才静默；人工执行要能看到反馈
+        if [ -t 1 ]; then ok "配置与上次一致，跳过重建（如需强制重建：bash $0 apply force）"; fi
         rm -f "$specs" "$gen_err"; return 0
     fi
 
     # 确实要重建了，这时才把生成阶段的告警打出来（巡检无变化时不再刷屏）
     [ -s "$gen_err" ] && sed 's/^/  /' "$gen_err" >&2
-    # 巡检检测到变化时，把事件写进专用日志（journal 保持安静，看变更就看这个文件）
-    if [ "${QUICK:-}" = "quick" ] && [ "${DRY_RUN:-0}" != "1" ]; then
-        printf '%s 端口变更重建 | 接口=%s | 类数=%s | 端口: %s\n' \
+    # 每次重建都记一条事件（谁触发都记：巡检自动 / 人工 / 开机）
+    if [ "${DRY_RUN:-0}" != "1" ]; then
+        printf '%s 重建 | 接口=%s | 类数=%s | 端口: %s\n' \
             "$(date '+%F %T')" "$iface" "$(awk 'END{print NR+0}' "$specs" 2>/dev/null)" \
             "$(awk '{printf "%s ", $3}' "$specs" 2>/dev/null)" >> "$EVENT_LOG" 2>/dev/null
     fi

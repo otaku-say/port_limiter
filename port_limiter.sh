@@ -51,7 +51,7 @@ RULE_FILE="${RULE_FILE:-$WORK_DIR/rules.conf}"
 CONFIG_FILE="${CONFIG_FILE:-$WORK_DIR/config}"
 SCRIPT_PATH="${SCRIPT_PATH:-$WORK_DIR/port_limiter.sh}"
 SERVICE_FILE="${SERVICE_FILE:-/etc/systemd/system/port-limiter.service}"
-STATE_DIR="${STATE_DIR:-/run/port_limiter}"
+STATE_DIR="${STATE_DIR:-$WORK_DIR}"      # 状态文件放配置目录（持久）；放 /run 会因重启丢失 ifb 归属信息
 TC_STATE="$STATE_DIR/tc.state"
 MODULES_FILE="/etc/modules-load.d/port_limiter.conf"
 
@@ -61,12 +61,13 @@ TC_DIR="${TC_DIR:-both}"
 TC_DEFAULT_RATE="${TC_DEFAULT_RATE:-10gbit}"
 TC_CAKE_OPTS="${TC_CAKE_OPTS:-triple-isolate nonat}"
 MAX_TC_PORTS="${MAX_TC_PORTS:-64}"
+HARD_MAX_TC_PORTS="${HARD_MAX_TC_PORTS:-256}"   # 硬上限：任何情况下单条规则都不超过这个端口数
 AUTO_INSTALL="${AUTO_INSTALL:-1}"
 [ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
 
 REQ_MODULES="sch_htb sch_cake cls_flower act_mirred ifb"
 DEFAULT_CLASS="ffff"
-IFB_NAME="ifb_pl"
+IFB_NAME="${IFB_NAME:-ifb_pl}"                  # 入方向中转网卡名；测试或多接口场景请改掉，避免互相覆盖
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; BLUE='\033[0;34m'; NC='\033[0m'
 info() { echo -e "${BLUE}$*${NC}"; }
@@ -220,7 +221,7 @@ tc_detect_iface() {
 # ------------------------------------------------------------------ 类规格生成
 # 输出「类号 速率(Mbit) 端口」；类号由出现顺序唯一确定 → 重复执行结果一致（幂等）
 gen_specs() {
-    local f1 f2 f3 f4 f5 line type ports mbps desc p n idx=0 ln=0
+    local f1 f2 f3 f4 f5 line type ports mbps desc p n idx=0 ln=0 cap
     while IFS='|' read -r f1 f2 f3 f4 f5; do
         [ -n "${f1:-}" ] || continue
         ln=$((ln + 1))
@@ -233,8 +234,10 @@ EOF
         case "$mbps" in ''|*[!0-9]*) warn "第 $ln 条：带宽必须是整数 Mbps，已跳过" >&2; continue;; esac
         [ "$mbps" -ge 1 ] || { warn "第 $ln 条：带宽必须 ≥1，已跳过" >&2; continue; }
         n="$(count_ports "$ports")"
-        if [ "$n" -gt "$MAX_TC_PORTS" ]; then
-            warn "第 $ln 条含 $n 个端口，超过 MAX_TC_PORTS=$MAX_TC_PORTS（整形需要一类一口），已跳过" >&2
+        cap="$MAX_TC_PORTS"
+        [ "$cap" -gt "$HARD_MAX_TC_PORTS" ] && cap="$HARD_MAX_TC_PORTS"
+        if [ "$n" -gt "$cap" ]; then
+            warn "第 $ln 条含 $n 个端口，超过上限 $cap —— tc 整形必须「一类一口」，每端口要建 1 个类 + 1 个队列 + 4 条过滤器（入方向再翻倍）；端口数越大构建越慢、内核对象越多，极端情况会把小机器压垮。已跳过该规则，请只列真实服务端口。" >&2
             continue
         fi
         if [ "$type" = "3" ]; then
@@ -251,16 +254,29 @@ EOF
 tc_do()  { if [ "${DRY_RUN:-0}" = "1" ]; then echo "    $*"; return 0; fi; "$@"; }
 tc_doq() { if [ "${DRY_RUN:-0}" = "1" ]; then echo "    $*   # 允许失败（幂等清理）"; return 0; fi; "$@" 2>/dev/null || true; }
 
+# 判断某接口是否挂有指定 qdisc。
+# 千万别写成 `tc qdisc show ... | grep -q ...`：grep -q 命中即退出，会让 tc 收到
+# SIGPIPE（退出码 141），在 set -o pipefail 下整条管道被判失败 → 明明已生效却报"未生效"。
+tc_qdisc_has() {
+    local out
+    out="$(tc qdisc show dev "$1" 2>/dev/null)" || return 1
+    case "$out" in *"$2"*) return 0 ;; *) return 1 ;; esac
+}
+
 # ------------------------------------------------------------------ 构建一棵整形树
 # $1=设备  $2=匹配关键字 src_port|dst_port  $3=specs 文件
 build_tree() {
-    local dev="$1" kw="$2" specs="$3" idx rate port fam
+    local dev="$1" kw="$2" specs="$3" idx rate port fam cnt=0
     tc_doq tc qdisc del dev "$dev" root                       # 幂等：先清旧的
     tc_do tc qdisc add dev "$dev" root handle 1: htb default "$DEFAULT_CLASS" || return 1
     tc_do tc class add dev "$dev" parent 1: classid "1:$DEFAULT_CLASS" htb rate "$TC_DEFAULT_RATE" ceil "$TC_DEFAULT_RATE" quantum 1500 || return 1
 
     while read -r idx rate port; do
         [ -n "${idx:-}" ] && [ -n "${port:-}" ] && [ -n "${rate:-}" ] || continue
+        cnt=$((cnt + 1))
+        if [ "${DRY_RUN:-0}" != "1" ] && [ $((cnt % 16)) -eq 0 ]; then
+            printf '    已配置 %d 个端口...\n' "$cnt"
+        fi
         tc_do tc class add dev "$dev" parent 1: classid "1:$idx" htb rate "${rate}mbit" ceil "${rate}mbit" burst 32k cburst 32k quantum 1500 \
             || { err "类 $idx（端口 $port）创建失败"; return 1; }
         tc_do tc qdisc add dev "$dev" parent "1:$idx" handle "$((idx + 1)):" cake bandwidth "${rate}mbit" $TC_CAKE_OPTS \
@@ -363,10 +379,10 @@ stop_all() {
     iface="${IFACE:-$(tc_detect_iface)}"
     ifb="${IFB:-}"
     if [ -n "$iface" ] && ip link show "$iface" >/dev/null 2>&1; then
-        if tc qdisc show dev "$iface" 2>/dev/null | grep -q '^qdisc ingress'; then
+        if tc_qdisc_has "$iface" "qdisc ingress"; then
             tc qdisc del dev "$iface" ingress >/dev/null 2>&1 && did=1
         fi
-        if tc qdisc show dev "$iface" 2>/dev/null | grep -q 'qdisc htb 1:'; then
+        if tc_qdisc_has "$iface" "qdisc htb 1:"; then
             tc qdisc del dev "$iface" root >/dev/null 2>&1 && did=1
             case "${ORIG_ROOT:-}" in
                 fq_codel)   tc qdisc add dev "$iface" root handle 1: fq_codel >/dev/null 2>&1 ;;
@@ -477,14 +493,20 @@ write_config() {
         echo "TC_DEFAULT_RATE=\"$TC_DEFAULT_RATE\""
         echo "TC_CAKE_OPTS=\"$TC_CAKE_OPTS\""
         echo "MAX_TC_PORTS=\"$MAX_TC_PORTS\""
+        echo "HARD_MAX_TC_PORTS=\"$HARD_MAX_TC_PORTS\""
+        echo "IFB_NAME=\"$IFB_NAME\""
         echo "AUTO_INSTALL=\"$AUTO_INSTALL\""
     } > "$CONFIG_FILE" 2>/dev/null
 }
 
 # ------------------------------------------------------------------ 服务 / 自启
 deploy_service() {
-    if has_systemd && [ ! -f "$SERVICE_FILE" ]; then
-        cat > "$SERVICE_FILE" <<EOF
+    has_systemd || return 0
+    # 版本变化时刷新单元描述（幂等：内容一致就不动）
+    if [ -f "$SERVICE_FILE" ] && grep -q "port_limiter v$VERSION" "$SERVICE_FILE" 2>/dev/null; then
+        return 0
+    fi
+    cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=Port peak bandwidth limiter (port_limiter v$VERSION, tc HTB+cake)
 After=network-online.target
@@ -499,8 +521,7 @@ ExecStop=$SCRIPT_PATH stop
 [Install]
 WantedBy=multi-user.target
 EOF
-        systemctl daemon-reload 2>/dev/null
-    fi
+    systemctl daemon-reload 2>/dev/null
 }
 
 has_systemd() { need_cmd systemctl && [ -d /run/systemd/system ]; }
@@ -607,8 +628,9 @@ menu_view_rules() {
     echo
     info "=== 当前规则 ==="
     if [ ! -s "$RULE_FILE" ]; then warn "暂无规则"; return 0; fi
-    awk -F'|' 'BEGIN{printf "%-5s %-6s %-22s %-8s %s\n","序号","类型","端口","Mbps","备注"}
-               {printf "%-5d %-6s %-22s %-8s %s\n", NR,$1,$2,$3,$4}' "$RULE_FILE"
+    # 表头手工对齐：awk 的 %-Ns 按「字节」补齐，中文列会错位
+    printf '%s%*s%s%*s%s%*s%s%*s%s\n' "序号" 2 "" "类型" 3 "" "端口" 19 "" "Mbps" 5 "" "备注"
+    awk -F'|' '{printf "%-5d %-6s %-22s %-8s %s\n", NR,$1,$2,$3,$4}' "$RULE_FILE"
     echo
     info "类型：1 离散端口各自独立 | 2 连续端口各自独立 | 3 连续端口共享额度"
     info "删除时输入「序号」即可（如输入 2 删除第 2 条）"
@@ -635,16 +657,18 @@ menu_settings() {
     echo " 2. 整形方向        当前：$TC_DIR（both 双向 / egress 仅出方向）"
     echo " 3. 兜底类速率      当前：$TC_DEFAULT_RATE（未匹配流量不受限）"
     echo " 4. cake 参数       当前：$TC_CAKE_OPTS"
-    echo " 5. 单规则端口上限  当前：$MAX_TC_PORTS"
+    echo " 5. 单规则端口上限  当前：$MAX_TC_PORTS（硬上限 $HARD_MAX_TC_PORTS）"
     echo " 6. 自动安装依赖    当前：$AUTO_INSTALL"
+    echo " 7. 入方向网卡名    当前：$IFB_NAME"
     read -r -p "选择要修改的项（回车返回）: " c
     case "${c:-}" in
         1) read -r -p "出接口（auto=自动识别）: " v; [ -n "$v" ] && TC_IFACE="$v" ;;
         2) read -r -p "整形方向 both|egress: " v; [ -n "$v" ] && TC_DIR="$v" ;;
         3) read -r -p "兜底类速率（如 10gbit）: " v; [ -n "$v" ] && TC_DEFAULT_RATE="$v" ;;
         4) read -r -p "cake 参数: " v; [ -n "$v" ] && TC_CAKE_OPTS="$v" ;;
-        5) read -r -p "单规则端口上限: " v; [ -n "$v" ] && MAX_TC_PORTS="$v" ;;
+        5) read -r -p "单规则端口上限（超过硬上限 $HARD_MAX_TC_PORTS 无效）: " v; [ -n "$v" ] && MAX_TC_PORTS="$v" ;;
         6) read -r -p "自动安装依赖 1/0: " v; [ -n "$v" ] && AUTO_INSTALL="$v" ;;
+        7) read -r -p "入方向网卡名（换名后需重新 apply）: " v; [ -n "$v" ] && IFB_NAME="$v" ;;
         "") return 0 ;;
         *) err "无效选择"; return 1 ;;
     esac
@@ -659,7 +683,7 @@ menu_status() {
     [ -f "$TC_STATE" ] && . "$TC_STATE"
     iface="${IFACE:-$(tc_detect_iface)}"
     echo "出接口：${iface:-未识别}   整形方向：$TC_DIR"
-    if [ -n "$iface" ] && tc qdisc show dev "$iface" 2>/dev/null | grep -q 'qdisc htb 1:'; then
+    if [ -n "$iface" ] && tc_qdisc_has "$iface" "qdisc htb 1:"; then
         echo "整形：已生效"
         show_brief
     else

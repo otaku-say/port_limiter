@@ -976,7 +976,7 @@ interactive() {
         echo " 9. 卸载（停止 + 清理残留）"
         echo " 0. 退出"
         echo "=============================================="
-        read -r -p "请输入菜单数字，或直接输入规则序号删除（如 2）: " choice
+        read -r -p "请输入菜单数字: " choice
         case "$choice" in
             1) menu_add_rule ;;
             2) menu_view_del ;;
@@ -989,13 +989,17 @@ interactive() {
             9) read -r -p "确认卸载并清理残留？(y/N): " a; case "$a" in y|Y) do_uninstall ;; *) warn "已取消" ;; esac ;;
             0) ok "再见"; exit 0 ;;
             *)
-                # 纯数字且非菜单项 → 视为规则序号，快捷删除
+                # 纯数字且非菜单项 → 按规则序号处理（需确认，避免误输入数字就删规则）
                 case "$choice" in
                     ''|*[!0-9]*) err "无效输入" ;;
                     *)
                         if resolve_line "$choice" >/dev/null; then
-                            delete_line "$choice" && { ok "已删除第 $choice 条规则，正在重新应用"; apply_all; } \
-                                                   || err "删除失败"
+                            read -r -p "确认删除第 $choice 条规则？(y/N): " yn
+                            case "$yn" in
+                                y|Y) delete_line "$choice" && { ok "已删除第 $choice 条规则，正在重新应用"; apply_all; } \
+                                                            || err "删除失败" ;;
+                                *)   info "已取消" ;;
+                            esac
                         else
                             err "未找到序号 $choice（当前共 $(count_rules) 条）"
                         fi ;;

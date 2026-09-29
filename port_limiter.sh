@@ -731,7 +731,7 @@ interactive() {
         echo "10. 修改整形参数（接口/方向/cake 等）"
         echo " 0. 退出"
         echo "=============================================="
-        read -r -p "请输入菜单数字，或直接输入规则序号删除（如 2）: " choice
+        read -r -p "请输入菜单数字: " choice
         case "$choice" in
             1) menu_add_rule ;;
             2) menu_view_rules ;;

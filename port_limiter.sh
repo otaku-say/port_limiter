@@ -1,6 +1,12 @@
 #!/bin/bash
 # ==============================================================================
-#  port_limiter v3.0.0  —— 端口峰值带宽整形器（仅 tc 实现）
+#  port_limiter v4.0.0  —— 端口峰值带宽整形器（tc HTB + cake）
+#
+#  ★ 默认工作模式：自动跟踪（auto-tracking）
+#    规则里可以放心写一大段端口（如 40001-41111）：脚本只为「本机真正在监听」的
+#    端口建类，并每 REFRESH_SEC 秒自动巡检 —— 端口上线则自动建类限速，
+#    端口下线则自动收回。巡检发现配置未变时直接跳过，不做任何重建
+#    （所以巡检开销只有一次 ss 快照 + 指纹比对，约几十毫秒）。
 # ------------------------------------------------------------------------------
 #  实现方式：tc HTB（每端口硬上限）+ cake（排队/AQM/每主机公平）
 #    超限的包「排队延后发出」而不是「直接丢弃」，吞吐上限不变，但不再有
@@ -29,35 +35,35 @@
 #
 #  用法：
 #    bash port_limiter.sh                # 交互式菜单
-#    bash port_limiter.sh apply boot     # 开机调用（服务单元使用，强制重建）
-#    bash port_limiter.sh apply          # 智能应用：配置与上次一致则跳过重建
-#    bash port_limiter.sh apply force    # 强制重建（清统计、有极短未整形窗口）
-#    bash port_limiter.sh stop           # 清除全部整形并还原
-#    bash port_limiter.sh check          # 干跑：只打印即将执行的 tc 命令，不动现网
+#    bash port_limiter.sh apply          # 应用（配置未变则跳过重建）
+#    bash port_limiter.sh apply force    # 强制重建
+#    bash port_limiter.sh apply boot     # 开机调用（强制重建）
+#    bash port_limiter.sh stop           # 停止并还原（保留脚本与规则）
+#    bash port_limiter.sh uninstall      # 一键卸载：停服务 + 清整形 + 删残留
+#    bash port_limiter.sh check          # 干跑：只打印即将执行的 tc 命令
 #    bash port_limiter.sh stats [秒]     # 统计：每端口实际通过量 + 排队丢弃
 #    bash port_limiter.sh caps           # 本机能力自检
 #
-#  性能与规模（实测：Debian13 / 内核6.18.54 / iproute2 6.15）
-#    - 命令批量下发：生成命令清单后一次 tc -batch（单进程），202 条命令
-#      逐条 397ms → 批量 9ms，快约 40 倍；老版 tc 不支持时自动逐条执行
-#    - 端口范围原生匹配（类型3 整段共享额度）：1111 个端口只需 1 个类 + 4 条过滤器
-#    - 动态建类（PORT_SOURCE=listen）：类型1/2 只为「本机真正在监听」的端口建类，
-#      规则里写一大段端口也不会产生空类；配合定时 apply（配置没变会自动跳过重建）使用
-#
 #  可调参数（写入 /etc/port_limiter/config 持久化）：
+#    PORT_SOURCE=listen      listen=只为在监听的端口建类（默认，自动跟踪）
+#                            config=按规则文件写的端口全量建类
+#    REFRESH_SEC=30          自动巡检间隔（0 = 不装巡检定时器）
+#    WARN_CLASSES=200        端口/类数超过此值时只提醒（不拦截）
 #    TC_IFACE=auto           出接口；auto=按默认路由自动识别
 #    TC_DIR=both             整形方向：both 双向 / egress 仅出方向
 #    TC_DEFAULT_RATE=10gbit  兜底类速率（未匹配流量不受限）
 #    TC_CAKE_OPTS="triple-isolate nonat"   cake 参数
-#    PORT_SOURCE=config      config=按规则文件全量建类 / listen=只为在监听的端口建类
-#    MAX_TC_PORTS=64         单条规则端口数软上限（类型1/2 一类一口）
-#    HARD_MAX_TC_PORTS=256   硬上限，任何情况下都不突破（防止误配把机器压垮）
-#    IFB_NAME=ifb_pl         入方向中转网卡名（测试/多接口场景必须换名）
+#    IFB_NAME=ifb_pl         入方向中转网卡名（测试/多接口场景请换名）
 #    AUTO_INSTALL=1          缺失依赖时自动用 apt 安装
+#
+#  规模与性能（实测：Debian13 / 内核6.18.54 / iproute2 6.15）
+#    - 命令批量下发：一次 tc -batch（单进程）代替逐条：202 条命令 397ms → 9ms
+#    - 端口范围原生匹配（类型3）：1111 个端口只需 1 个类 + 4 条过滤器
+#    - 自动跟踪：规则 2|40001-41111|30 在本机只监听 12 个口时 → 只建 13 个类
 # ==============================================================================
 set -uo pipefail
 
-VERSION="3.0.0"
+VERSION="4.0.0"
 WORK_DIR="${WORK_DIR:-/etc/port_limiter}"
 RULE_FILE="${RULE_FILE:-$WORK_DIR/rules.conf}"
 CONFIG_FILE="${CONFIG_FILE:-$WORK_DIR/config}"
@@ -65,18 +71,18 @@ SCRIPT_PATH="${SCRIPT_PATH:-$WORK_DIR/port_limiter.sh}"
 SERVICE_FILE="${SERVICE_FILE:-/etc/systemd/system/port-limiter.service}"
 STATE_DIR="${STATE_DIR:-$WORK_DIR}"      # 状态文件放配置目录（持久）；放 /run 会因重启丢失 ifb 归属信息
 TC_STATE="$STATE_DIR/tc.state"
-MODULES_FILE="/etc/modules-load.d/port_limiter.conf"
+MODULES_FILE="${MODULES_FILE:-/etc/modules-load.d/port_limiter.conf}"
 
 # 默认参数（config 文件可覆盖）
 TC_IFACE="${TC_IFACE:-auto}"
 TC_DIR="${TC_DIR:-both}"
 TC_DEFAULT_RATE="${TC_DEFAULT_RATE:-10gbit}"
 TC_CAKE_OPTS="${TC_CAKE_OPTS:-triple-isolate nonat}"
-MAX_TC_PORTS="${MAX_TC_PORTS:-64}"
-HARD_MAX_TC_PORTS="${HARD_MAX_TC_PORTS:-256}"   # 硬上限：任何情况下单条规则都不超过这个端口数
-# 端口来源：config = 按规则文件里写的端口全量建类
-#           listen = 只为本机「真正在监听」的端口建类（动态建类，省掉大量空类）
-PORT_SOURCE="${PORT_SOURCE:-config}"
+# 端口来源：listen = 只为本机「真正在监听」的端口建类（默认，自动跟踪）
+#           config = 按规则文件里写的端口全量建类
+PORT_SOURCE="${PORT_SOURCE:-listen}"
+REFRESH_SEC="${REFRESH_SEC:-30}"      # 自动巡检间隔秒数（0 = 不安装巡检定时器）
+WARN_CLASSES="${WARN_CLASSES:-200}"   # 计划建类数超过该值时只提醒、不拦截（0 = 关闭提醒）
 AUTO_INSTALL="${AUTO_INSTALL:-1}"
 [ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
 
@@ -150,7 +156,12 @@ probe_env() {
 }
 
 ensure_deps() {
-    local need=""
+    # $1=quick：巡检路径复用上次探测结果（省掉 dummy 网卡探测，几十毫秒完成）
+    local quick="${1:-}" need=""
+    if [ "$quick" = "quick" ] && [ "${CAPS_OK:-0}" = "1" ] && need_cmd tc && need_cmd ip; then
+        probe_batch
+        return 0
+    fi
     need_cmd tc       || need="$need iproute2"
     need_cmd ip       || need="$need iproute2"
     need_cmd modprobe || need="$need kmod"
@@ -184,6 +195,7 @@ ensure_deps() {
     if [ -d /etc/modules-load.d ] && [ "${DRY_RUN:-0}" != "1" ]; then
         printf '%s\n' $REQ_MODULES > "$MODULES_FILE" 2>/dev/null
     fi
+    CAPS_OK=1        # 供巡检路径复用，避免每次都做 dummy 网卡探测
     return 0
 }
 
@@ -219,16 +231,6 @@ count_ports() { expand_ports "$1" 2>/dev/null | awk 'END{print NR+0}'; }
 validate_ports() { expand_ports "$1" >/dev/null 2>&1; }
 count_rules() { awk 'END{print NR+0}' "$RULE_FILE" 2>/dev/null; }
 
-# 规则行解析：当前格式「类型|端口|Mbps|备注」
-# 若首列是 8 位以上纯数字（老版本的时间戳 ID），自动忽略该列——一次性迁移，不算兼容负担
-parse_rule_line() {
-    local f1="${1:-}" f2="${2:-}" f3="${3:-}" f4="${4:-}" f5="${5:-}"
-    case "$f1" in
-        [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]*) echo "$f2|$f3|$f4|$f5" ;;
-        *)                                         echo "$f1|$f2|$f3|$f4" ;;
-    esac
-}
-
 tc_detect_iface() {
     if [ -n "${TC_IFACE:-}" ] && [ "$TC_IFACE" != "auto" ]; then echo "$TC_IFACE"; return 0; fi
     ip route show default 2>/dev/null | awk '/^default/{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'
@@ -249,14 +251,10 @@ local_listen_ports() {
 # ------------------------------------------------------------------ 类规格生成
 # 输出「类号 速率(Mbit) 端口」；类号由出现顺序唯一确定 → 重复执行结果一致（幂等）
 gen_specs() {
-    local f1 f2 f3 f4 f5 line type ports mbps desc p n idx=0 ln=0 cap unit kept_ports kept total_ports
-    while IFS='|' read -r f1 f2 f3 f4 f5; do
-        [ -n "${f1:-}" ] || continue
+    local type ports mbps desc p n idx=0 ln=0 unit kept_ports kept total_ports
+    while IFS='|' read -r type ports mbps desc; do
+        [ -n "${type:-}" ] || continue
         ln=$((ln + 1))
-        line="$(parse_rule_line "$f1" "$f2" "$f3" "$f4" "$f5")"
-        IFS='|' read -r type ports mbps desc <<EOF
-$line
-EOF
         case "$type" in 1|2|3) ;; *) warn "第 $ln 条：类型非法（$type），已跳过" >&2; continue;; esac
         validate_ports "$ports" || { warn "第 $ln 条：端口表达式非法（$ports），已跳过" >&2; continue; }
         case "$mbps" in ''|*[!0-9]*) warn "第 $ln 条：带宽必须是整数 Mbps，已跳过" >&2; continue;; esac
@@ -276,14 +274,12 @@ EOF
             fi
         fi
 
-        cap="$MAX_TC_PORTS"
-        [ "$cap" -gt "$HARD_MAX_TC_PORTS" ] && cap="$HARD_MAX_TC_PORTS"
         if [ "$type" = "3" ]; then
             # 类型3 走端口范围匹配，成本按「端口段(token)数」算
             n="$(printf '%s' "$(norm_ports "$ports" | tr ',' ' ')" | wc -w)"
             unit="个端口段"
         elif [ "$kept" -gt 0 ]; then
-            # 动态建类：成本只按「真正要建类的端口数」算
+            # 自动跟踪：成本只按「真正要建类的端口数」算
             n="$kept"
             unit="个监听端口"
         else
@@ -291,9 +287,9 @@ EOF
             n="$(count_ports "$ports")"
             unit="个端口"
         fi
-        if [ "$n" -gt "$cap" ]; then
-            warn "第 $ln 条含 $n $unit，超过上限 $cap —— 类型1/2 每端口要建 1 个类 + 1 个队列 + 4 条过滤器（入方向再翻倍）；大范围端口可改用类型3（整段共享额度，范围匹配只需 1 个类 + 1 条过滤器），或把 PORT_SOURCE 设为 listen（只给真正在监听的端口建类）。已跳过该规则。" >&2
-            continue
+        # 不再设端口数上限；只在规模偏大时提醒（WARN_CLASSES=0 可关闭）
+        if [ "${WARN_CLASSES:-0}" -gt 0 ] && [ "$n" -gt "$WARN_CLASSES" ]; then
+            warn "第 $ln 条计划建 $n $unit 个类 —— 每个类要配 1 个队列 + 4 条过滤器（入方向翻倍），内核对象与构建时间随端口数线性增长；请确认符合预期（WARN_CLASSES 可调，0 = 关闭提醒）。" >&2
         fi
         if [ "$type" = "3" ]; then
             # 类型3 = 整段共享额度 → 共用一个类。
@@ -431,7 +427,8 @@ apply_tree() {
 # ------------------------------------------------------------------ 应用（幂等）
 apply_all() {
     warn_if_test_mode
-    ensure_deps || return 1
+    [ -f "$TC_STATE" ] && . "$TC_STATE"      # 取回上次的能力探测结论与配置指纹
+    ensure_deps "${QUICK:-}" || return 1
     local iface specs ORIG_ROOT="" IFB_CREATED=0
     iface="$(tc_detect_iface)"
     [ -n "$iface" ] || { err "未能识别出接口，请设置 TC_IFACE=eth0"; return 1; }
@@ -493,6 +490,8 @@ apply_all() {
         printf "IFB_CREATED='%s'\n" "$IFB_CREATED"
         printf "ORIG_ROOT='%s'\n" "$ORIG_ROOT"
         printf "SIG='%s'\n" "$sig"
+        printf "CAPS_OK='%s'\n" "${CAPS_OK:-0}"
+        printf "IFB_OK='%s'\n" "${IFB_OK:-0}"
     } > "$TC_STATE" 2>/dev/null
 
     [ "${DRY_RUN:-0}" != "1" ] && show_brief
@@ -619,9 +618,9 @@ write_config() {
         echo "TC_DIR=\"$TC_DIR\""
         echo "TC_DEFAULT_RATE=\"$TC_DEFAULT_RATE\""
         echo "TC_CAKE_OPTS=\"$TC_CAKE_OPTS\""
-        echo "MAX_TC_PORTS=\"$MAX_TC_PORTS\""
-        echo "HARD_MAX_TC_PORTS=\"$HARD_MAX_TC_PORTS\""
         echo "PORT_SOURCE=\"$PORT_SOURCE\""
+        echo "REFRESH_SEC=\"$REFRESH_SEC\""
+        echo "WARN_CLASSES=\"$WARN_CLASSES\""
         echo "IFB_NAME=\"$IFB_NAME\""
         echo "AUTO_INSTALL=\"$AUTO_INSTALL\""
     } > "$CONFIG_FILE" 2>/dev/null
@@ -654,17 +653,70 @@ EOF
 
 has_systemd() { need_cmd systemctl && [ -d /run/systemd/system ]; }
 
+# ---- 自动巡检定时器（默认模式）：端口上线/下线后自动建类或收回 ----
+REFRESH_SERVICE_FILE="${REFRESH_SERVICE_FILE:-/etc/systemd/system/port-limiter-refresh.service}"
+REFRESH_TIMER_FILE="${REFRESH_TIMER_FILE:-/etc/systemd/system/port-limiter-refresh.timer}"
+
+deploy_refresh_timer() {
+    has_systemd || return 0
+    if [ "${REFRESH_SEC:-0}" -le 0 ]; then disable_refresh_timer; return 0; fi
+    cat > "$REFRESH_SERVICE_FILE" <<EOF
+[Unit]
+Description=port_limiter auto-refresh (扫描监听端口变化并自动重建)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$SCRIPT_PATH apply
+EOF
+    cat > "$REFRESH_TIMER_FILE" <<EOF
+[Unit]
+Description=port_limiter 自动巡检定时器（每 ${REFRESH_SEC} 秒）
+
+[Timer]
+OnBootSec=20s
+OnUnitActiveSec=${REFRESH_SEC}s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl daemon-reload 2>/dev/null
+    systemctl enable --now port-limiter-refresh.timer >/dev/null 2>&1
+}
+
+disable_refresh_timer() {
+    has_systemd || return 0
+    systemctl disable --now port-limiter-refresh.timer >/dev/null 2>&1
+    rm -f "$REFRESH_TIMER_FILE" "$REFRESH_SERVICE_FILE" 2>/dev/null
+    systemctl daemon-reload 2>/dev/null
+}
+
+# 首次运行把单元装好（幂等；配置未变时巡检本身几乎零开销）
+ensure_units() {
+    has_systemd || return 0
+    if [ ! -f "$SERVICE_FILE" ] || { [ "${REFRESH_SEC:-0}" -gt 0 ] && [ ! -f "$REFRESH_TIMER_FILE" ]; }; then
+        deploy_service
+        deploy_refresh_timer
+        systemctl enable port-limiter.service >/dev/null 2>&1
+    fi
+}
+
 enable_autostart() {
     if has_systemd; then
         deploy_service
-        systemctl enable port-limiter.service >/dev/null 2>&1 && ok "已设置开机自启（systemd）" || { err "systemd 启用失败"; return 1; }
+        deploy_refresh_timer
+        systemctl enable port-limiter.service >/dev/null 2>&1 \
+            && ok "已设置开机自启（systemd）" || { err "systemd 启用失败"; return 1; }
+        [ "${REFRESH_SEC:-0}" -gt 0 ] && ok "自动巡检已启用（每 ${REFRESH_SEC} 秒扫描一次监听端口变化）"
         return 0
     fi
     if [ -d /etc/local.d ]; then
         printf '#!/bin/sh\n%s apply boot\n' "$SCRIPT_PATH" > /etc/local.d/port_limiter.start
         chmod +x /etc/local.d/port_limiter.start
         rc-update add local default >/dev/null 2>&1
-        ok "已设置开机自启（OpenRC /etc/local.d）"; return 0
+        ok "已设置开机自启（OpenRC /etc/local.d）；非 systemd 环境无内置巡检，可自行加 cron"
+        return 0
     fi
     local rc=/etc/rc.local
     [ -f "$rc" ] || { printf '#!/bin/sh -e\nexit 0\n' > "$rc"; chmod +x "$rc"; }
@@ -675,6 +727,7 @@ enable_autostart() {
 disable_autostart() {
     if has_systemd; then
         systemctl disable port-limiter.service >/dev/null 2>&1 && ok "已取消开机自启" || warn "取消自启失败或本就未启用"
+        disable_refresh_timer
         return 0
     fi
     rm -f /etc/local.d/port_limiter.start 2>/dev/null
@@ -734,9 +787,11 @@ menu_add_rule() {
     read -r -p "选择类型: " type
     case "$type" in 1|2|3) ;; *) err "无效类型"; return 1;; esac
 
-    read -r -p "端口（支持逗号与范围）: " ports
+    read -r -p "端口（支持逗号与范围，可写一大段如 40001-41111）: " ports
     validate_ports "$ports" || { err "端口表达式非法：$ports"; return 1; }
-    [ "$(count_ports "$ports")" -le "$MAX_TC_PORTS" ] || { err "端口数超过 MAX_TC_PORTS=$MAX_TC_PORTS（整形需要一类一口），请只列真实服务端口"; return 1; }
+    if [ "$PORT_SOURCE" = "listen" ]; then
+        info "自动跟踪已开启：只会为「本机在监听」的端口建类，端口上线后 $REFRESH_SEC 秒内自动限速"
+    fi
 
     read -r -p "峰值带宽（整数 Mbps）: " mbps
     case "$mbps" in ''|*[!0-9]*) err "带宽必须是整数"; return 1;; esac
@@ -764,20 +819,6 @@ menu_view_rules() {
     info "删除时输入「序号」即可（如输入 2 删除第 2 条）"
 }
 
-menu_del_rule() {
-    menu_view_rules
-    [ -s "$RULE_FILE" ] || return 0
-    read -r -p "输入要删除的规则序号: " num
-    resolve_line "$num" >/dev/null || { err "没有这条规则（序号需在 1..$(count_rules) 之间）"; return 1; }
-    if delete_line "$num"; then
-        ok "已删除第 $num 条规则"
-        read -r -p "立即重新应用？(Y/n): " a
-        case "${a:-y}" in y|Y|"") apply_all;; esac
-    else
-        err "删除失败"
-    fi
-}
-
 menu_settings() {
     echo
     info "=== 整形参数（写入 $CONFIG_FILE 持久化）==="
@@ -785,26 +826,34 @@ menu_settings() {
     echo " 2. 整形方向        当前：$TC_DIR（both 双向 / egress 仅出方向）"
     echo " 3. 兜底类速率      当前：$TC_DEFAULT_RATE（未匹配流量不受限）"
     echo " 4. cake 参数       当前：$TC_CAKE_OPTS"
-    echo " 5. 单规则端口上限  当前：$MAX_TC_PORTS（硬上限 $HARD_MAX_TC_PORTS）"
-    echo " 6. 自动安装依赖    当前：$AUTO_INSTALL"
-    echo " 7. 入方向网卡名    当前：$IFB_NAME"
-    echo " 8. 端口来源        当前：$PORT_SOURCE（config=按规则文件全量建类 / listen=只为在监听的端口建类）"
+    echo " 5. 自动巡检间隔    当前：${REFRESH_SEC} 秒（0 = 不安装巡检定时器）"
+    echo " 6. 端口来源        当前：$PORT_SOURCE（listen=只为在监听的端口建类 / config=全量建类）"
+    echo " 7. 规模提醒阈值    当前：$WARN_CLASSES（计划建类数超过它只提醒不拦截；0 = 关闭）"
+    echo " 8. 入方向网卡名    当前：$IFB_NAME"
+    echo " 9. 自动安装依赖    当前：$AUTO_INSTALL"
     read -r -p "选择要修改的项（回车返回）: " c
     case "${c:-}" in
         1) read -r -p "出接口（auto=自动识别）: " v; [ -n "$v" ] && TC_IFACE="$v" ;;
-        2) read -r -p "整形方向 both|egress: " v; [ -n "$v" ] && TC_DIR="$v" ;;
+        2) read -r -p "整形方向 both|egress: " v
+           case "$v" in both|egress) TC_DIR="$v" ;; *) err "只能填 both 或 egress"; return 1 ;; esac ;;
         3) read -r -p "兜底类速率（如 10gbit）: " v; [ -n "$v" ] && TC_DEFAULT_RATE="$v" ;;
         4) read -r -p "cake 参数: " v; [ -n "$v" ] && TC_CAKE_OPTS="$v" ;;
-        5) read -r -p "单规则端口上限（超过硬上限 $HARD_MAX_TC_PORTS 无效）: " v; [ -n "$v" ] && MAX_TC_PORTS="$v" ;;
-        6) read -r -p "自动安装依赖 1/0: " v; [ -n "$v" ] && AUTO_INSTALL="$v" ;;
-        7) read -r -p "入方向网卡名（换名后需重新 apply）: " v; [ -n "$v" ] && IFB_NAME="$v" ;;
-        8) read -r -p "端口来源 config|listen: " v
-           case "$v" in config|listen) PORT_SOURCE="$v" ;; *) err "只能填 config 或 listen"; return 1 ;; esac ;;
+        5) read -r -p "自动巡检间隔秒数（0=关闭）: " v
+           case "$v" in ''|*[!0-9]*) err "必须是整数秒"; return 1 ;; esac
+           REFRESH_SEC="$v" ;;
+        6) read -r -p "端口来源 listen|config: " v
+           case "$v" in listen|config) PORT_SOURCE="$v" ;; *) err "只能填 listen 或 config"; return 1 ;; esac ;;
+        7) read -r -p "规模提醒阈值（0=关闭提醒）: " v
+           case "$v" in ''|*[!0-9]*) err "必须是整数"; return 1 ;; esac
+           WARN_CLASSES="$v" ;;
+        8) read -r -p "入方向网卡名（换名后需重新 apply）: " v; [ -n "$v" ] && IFB_NAME="$v" ;;
+        9) read -r -p "自动安装依赖 1/0: " v; [ -n "$v" ] && AUTO_INSTALL="$v" ;;
         "") return 0 ;;
         *) err "无效选择"; return 1 ;;
     esac
     write_config
     ok "已保存到 $CONFIG_FILE"
+    has_systemd && deploy_refresh_timer
 }
 
 menu_status() {
@@ -838,42 +887,106 @@ menu_status() {
     echo "  init 系统  : $(has_systemd && echo systemd || echo '非 systemd')"
 }
 
+# 查看 + 删除合并：列表带序号，输入序号即删除
+menu_view_del() {
+    menu_view_rules
+    [ -s "$RULE_FILE" ] || return 0
+    echo
+    read -r -p "输入规则序号即可删除（回车返回）: " num
+    [ -n "${num:-}" ] || return 0
+    case "$num" in ''|*[!0-9]*) err "请输入序号"; return 1;; esac
+    resolve_line "$num" >/dev/null || { err "没有这条规则（序号需在 1..$(count_rules) 之间）"; return 1; }
+    if delete_line "$num"; then
+        ok "已删除第 $num 条规则，正在重新应用"
+        apply_all
+    else
+        err "删除失败"
+    fi
+}
+
+# 开机自启 + 自动巡检 的总开关
+toggle_autostart() {
+    echo
+    if has_systemd; then
+        if systemctl is-enabled port-limiter.service >/dev/null 2>&1; then
+            echo "当前：开机自启=已启用，自动巡检=$([ -f "$REFRESH_TIMER_FILE" ] && echo 已启用 || echo 未启用)"
+            read -r -p "要全部取消吗？(y/N): " a
+            case "$a" in y|Y) disable_autostart ;; *) info "保持不变" ;; esac
+        else
+            echo "当前：开机自启=未启用"
+            read -r -p "要启用吗？(Y/n): " a
+            case "${a:-y}" in y|Y) enable_autostart; deploy_refresh_timer ;; *) info "保持不变" ;; esac
+        fi
+    else
+        info "非 systemd 环境：自启写入 local.d / rc.local（无内置巡检，可用 cron 定时执行 apply）"
+        read -r -p "要启用自启吗？(Y/n): " a
+        case "${a:-y}" in y|Y) enable_autostart ;; esac
+    fi
+}
+
+# 一键卸载：停服务 + 清整形 + 删单元与残留
+#   默认保留规则与配置（便于重装后继续用）；`uninstall purge` 连配置目录一起删
+do_uninstall() {
+    local mode="${1:-}"
+    info "开始卸载 port_limiter ..."
+    if has_systemd; then
+        systemctl disable --now port-limiter-refresh.timer >/dev/null 2>&1
+        systemctl stop port-limiter-refresh.service >/dev/null 2>&1
+        systemctl disable --now port-limiter.service >/dev/null 2>&1
+        rm -f "$REFRESH_TIMER_FILE" "$REFRESH_SERVICE_FILE" "$SERVICE_FILE" 2>/dev/null
+        systemctl daemon-reload 2>/dev/null
+        ok "已停止并删除 systemd 单元"
+    fi
+    stop_all
+    rm -f "$MODULES_FILE" 2>/dev/null
+    rm -rf /run/port_limiter 2>/dev/null
+    if [ "$mode" = "purge" ]; then
+        rm -rf "$WORK_DIR" 2>/dev/null
+        ok "已删除 $WORK_DIR（含规则、配置、脚本）"
+    else
+        rm -f "$TC_STATE" 2>/dev/null
+        ok "已保留 $WORK_DIR（规则与配置还在；连它一起删：bash $SCRIPT_PATH uninstall purge）"
+    fi
+    ok "卸载完成"
+}
+
 interactive() {
     require_root
     mkdir -p "$WORK_DIR"; touch "$RULE_FILE"
     fixate_self
+    ensure_units
     ensure_deps || exit 1
-    has_systemd && deploy_service
-    ok "port_limiter v$VERSION 已就绪（tc HTB+cake 整形 / TCP+UDP 双栈 / 不限连接数）"
+    ok "port_limiter v$VERSION 已就绪（tc HTB+cake / TCP+UDP 双栈 / 不限连接数）"
+    if [ "${REFRESH_SEC:-0}" -gt 0 ] && has_systemd; then
+        info "自动跟踪已启用：每 ${REFRESH_SEC} 秒巡检监听端口变化（规则里可放心写大范围端口）"
+    fi
     while true; do
         echo
         echo "=============================================="
-        echo "   端口峰值带宽管理面板  v$VERSION  [tc 整形]"
+        echo "   端口峰值带宽管理面板  v$VERSION"
         echo "=============================================="
         echo " 1. 添加限速规则"
-        echo " 2. 查看当前规则"
-        echo " 3. 删除规则"
-        echo " 4. 立即应用 / 重启整形"
-        echo " 5. 停止并移除全部整形"
-        echo " 6. 运行状态 + 能力自检"
-        echo " 7. 统计（每端口通过量 / 排队丢弃）"
-        echo " 8. 设置开机自启"
-        echo " 9. 取消开机自启"
-        echo "10. 修改整形参数（接口/方向/cake 等）"
+        echo " 2. 查看 / 删除规则（输入序号即删除）"
+        echo " 3. 立即应用 / 重启整形"
+        echo " 4. 停止并移除全部整形"
+        echo " 5. 运行状态 + 能力自检"
+        echo " 6. 统计（每端口通过量 / 排队丢弃）"
+        echo " 7. 开机自启 / 自动巡检 开关"
+        echo " 8. 修改整形参数（接口 / 方向 / 巡检间隔等）"
+        echo " 9. 卸载（停止 + 清理残留）"
         echo " 0. 退出"
         echo "=============================================="
         read -r -p "请输入菜单数字，或直接输入规则序号删除（如 2）: " choice
         case "$choice" in
             1) menu_add_rule ;;
-            2) menu_view_rules ;;
-            3) menu_del_rule ;;
-            4) FORCE=1 apply_all ;;
-            5) stop_all ;;
-            6) menu_status ;;
-            7) read -r -p "采样秒数（默认 10）: " s; show_stats "${s:-10}" ;;
-            8) enable_autostart ;;
-            9) disable_autostart ;;
-            10) menu_settings ;;
+            2) menu_view_del ;;
+            3) FORCE=1 apply_all ;;
+            4) stop_all ;;
+            5) menu_status ;;
+            6) read -r -p "采样秒数（默认 10）: " s; show_stats "${s:-10}" ;;
+            7) toggle_autostart ;;
+            8) menu_settings ;;
+            9) read -r -p "确认卸载并清理残留？(y/N): " a; case "$a" in y|Y) do_uninstall ;; *) warn "已取消" ;; esac ;;
             0) ok "再见"; exit 0 ;;
             *)
                 # 纯数字且非菜单项 → 视为规则序号，快捷删除
@@ -894,16 +1007,21 @@ interactive() {
 main() {
     case "${1:-}" in
         apply)  require_root
-                case "${2:-}" in boot|force) FORCE=1 ;; esac
+                case "${2:-}" in
+                    boot|force) FORCE=1 ;;
+                    *)          QUICK=quick ;;      # 巡检路径：复用上次的能力探测结论
+                esac
+                ensure_units
                 apply_all; exit $? ;;
-        stop)   require_root; stop_all; exit $? ;;
-        check)  require_root; DRY_RUN=1 apply_all; exit $? ;;
-        stats)  require_root; show_stats "${2:-10}"; exit $? ;;
-        caps)   require_root; ensure_deps >/dev/null 2>&1; menu_status; exit 0 ;;
-        "")     interactive ;;
-        *)      echo "端口峰值带宽整形器 v$VERSION（tc HTB+cake）"
-                echo "用法: $0 [apply boot|stop|check|stats [秒]|caps]"
-                exit 1 ;;
+        stop)      require_root; stop_all; exit $? ;;
+        uninstall) require_root; do_uninstall "${2:-}"; exit $? ;;
+        check)     require_root; DRY_RUN=1 apply_all; exit $? ;;
+        stats)     require_root; show_stats "${2:-10}"; exit $? ;;
+        caps)      require_root; ensure_deps >/dev/null 2>&1; menu_status; exit 0 ;;
+        "")        interactive ;;
+        *)         echo "端口峰值带宽整形器 v$VERSION（tc HTB+cake）"
+                   echo "用法: $0 [apply [boot|force]|stop|uninstall [purge]|check|stats [秒]|caps]"
+                   exit 1 ;;
     esac
 }
 

@@ -5,8 +5,9 @@
 #  ★ 默认工作模式：自动跟踪（auto-tracking）
 #    规则里可以放心写一大段端口（如 40001-41111）：脚本只为「本机真正在监听」的
 #    端口建类，并每 REFRESH_SEC 秒自动巡检 —— 端口上线则自动建类限速，
-#    端口下线则自动收回。巡检发现配置未变时直接跳过，不做任何重建
-#    （所以巡检开销只有一次 ss 快照 + 指纹比对，约几十毫秒）。
+#    端口下线则自动收回。巡检发现配置未变时直接跳过，不做任何重建（开销只有一次
+#    ss 快照 + 指纹比对，约几十毫秒）；变更事件写入 EVENT_LOG（默认 /var/log/port_limiter.log），
+#    巡检无变化时不产生任何日志。
 # ------------------------------------------------------------------------------
 #  实现方式：tc HTB（每端口硬上限）+ cake（排队/AQM/每主机公平）
 #    超限的包「排队延后发出」而不是「直接丢弃」，吞吐上限不变，但不再有
@@ -83,6 +84,7 @@ TC_CAKE_OPTS="${TC_CAKE_OPTS:-triple-isolate nonat}"
 PORT_SOURCE="${PORT_SOURCE:-listen}"
 REFRESH_SEC="${REFRESH_SEC:-30}"      # 自动巡检间隔秒数（0 = 不安装巡检定时器）
 WARN_CLASSES="${WARN_CLASSES:-200}"   # 计划建类数超过该值时只提醒、不拦截（0 = 关闭提醒）
+EVENT_LOG="${EVENT_LOG:-/var/log/port_limiter.log}"   # 自动跟踪的变更事件日志（端口上下线）
 AUTO_INSTALL="${AUTO_INSTALL:-1}"
 [ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
 
@@ -434,7 +436,27 @@ apply_all() {
     [ -n "$iface" ] || { err "未能识别出接口，请设置 TC_IFACE=eth0"; return 1; }
     ip link show "$iface" >/dev/null 2>&1 || { err "接口不存在：$iface"; return 1; }
 
-    specs="$(mktemp)"; gen_specs > "$specs"
+    gen_err="$(mktemp)"
+    specs="$(mktemp)"; gen_specs > "$specs" 2>"$gen_err"
+    # 配置与上次完全一致时跳过重建：周期性刷新（配合 PORT_SOURCE=listen）才不会
+    # 反复销毁重建 —— 每次重建都会清空统计、并有极短的未整形窗口。
+    # 巡检路径（QUICK=quick）全程安静：否则每 30 秒刷一条日志，一天几千行。
+    local sig stored
+    sig="$( { cat "$specs"; echo "$iface|$TC_DIR|$TC_CAKE_OPTS|$TC_DEFAULT_RATE|$IFB_NAME|$PORT_SOURCE"; } | md5sum | cut -d' ' -f1)"
+    stored="$(sed -n "s/^SIG='\([^']*\)'.*/\1/p" "$TC_STATE" 2>/dev/null | head -1)"
+    if [ "${FORCE:-0}" != "1" ] && [ -n "$stored" ] && [ "$sig" = "$stored" ] && tc_qdisc_has "$iface" "qdisc htb 1:"; then
+        [ "${QUICK:-}" = "quick" ] || ok "配置与上次一致，跳过重建（如需强制重建：bash $0 apply force）"
+        rm -f "$specs" "$gen_err"; return 0
+    fi
+
+    # 确实要重建了，这时才把生成阶段的告警打出来（巡检无变化时不再刷屏）
+    [ -s "$gen_err" ] && sed 's/^/  /' "$gen_err" >&2
+    # 巡检检测到变化时，把事件写进专用日志（journal 保持安静，看变更就看这个文件）
+    if [ "${QUICK:-}" = "quick" ] && [ "${DRY_RUN:-0}" != "1" ]; then
+        printf '%s 端口变更重建 | 接口=%s | 类数=%s | 端口: %s\n' \
+            "$(date '+%F %T')" "$iface" "$(awk 'END{print NR+0}' "$specs" 2>/dev/null)" \
+            "$(awk '{printf "%s ", $3}' "$specs" 2>/dev/null)" >> "$EVENT_LOG" 2>/dev/null
+    fi
     if [ ! -s "$specs" ]; then
         if [ ! -s "$RULE_FILE" ]; then
             warn "规则文件为空：本次只清理旧配置（请在菜单 1 添加规则）"
@@ -443,22 +465,12 @@ apply_all() {
         fi
     fi
 
-    # 配置与上次完全一致时跳过重建：周期性刷新（配合 PORT_SOURCE=listen）才不会
-    # 反复销毁重建 —— 每次重建都会清空统计、并有极短的未整形窗口
-    local sig stored
-    sig="$( { cat "$specs"; echo "$iface|$TC_DIR|$TC_CAKE_OPTS|$TC_DEFAULT_RATE|$IFB_NAME|$PORT_SOURCE"; } | md5sum | cut -d' ' -f1)"
-    stored="$(sed -n "s/^SIG='\([^']*\)'.*/\1/p" "$TC_STATE" 2>/dev/null | head -1)"
-    if [ "${FORCE:-0}" != "1" ] && [ -n "$stored" ] && [ "$sig" = "$stored" ] && tc_qdisc_has "$iface" "qdisc htb 1:"; then
-        ok "配置与上次一致，跳过重建（如需强制重建：bash $0 apply force）"
-        rm -f "$specs"; return 0
-    fi
-
     info "整形接口：$iface（方向：$TC_DIR）"
     ORIG_ROOT="$(tc qdisc show dev "$iface" 2>/dev/null | head -1 | awk '{for(i=1;i<=NF;i++) if($i=="qdisc"){print $(i+1); exit}}')"
     case "$ORIG_ROOT" in htb) ORIG_ROOT="";; esac   # 已是我们的（或别人的）htb，不必还原
 
     # 1) 出方向（按源端口分类 = 我们的端口发送给客户的流量）
-    apply_tree "$iface" src_port "$specs" || { rm -f "$specs"; return 1; }
+    apply_tree "$iface" src_port "$specs" || { rm -f "$specs" "$gen_err"; return 1; }
 
     # 2) 入方向（ifb 中转；内核不能直接整形入站）
     if [ "$TC_DIR" = "both" ]; then
@@ -486,7 +498,7 @@ apply_all() {
         fi
     fi
 
-    rm -f "$specs"
+    rm -f "$specs" "$gen_err"
     mkdir -p "$STATE_DIR" 2>/dev/null
     {
         printf "IFACE='%s'\n" "$iface"
@@ -664,16 +676,25 @@ REFRESH_TIMER_FILE="${REFRESH_TIMER_FILE:-/etc/systemd/system/port-limiter-refre
 deploy_refresh_timer() {
     has_systemd || return 0
     if [ "${REFRESH_SEC:-0}" -le 0 ]; then disable_refresh_timer; return 0; fi
+    # 已是最新版本就不动（幂等；升级脚本后单元会自动刷新）
+    if [ -f "$REFRESH_TIMER_FILE" ] && grep -q "port_limiter v$VERSION" "$REFRESH_TIMER_FILE" 2>/dev/null; then
+        systemctl is-active port-limiter-refresh.timer >/dev/null 2>&1 || systemctl start port-limiter-refresh.timer >/dev/null 2>&1
+        return 0
+    fi
     cat > "$REFRESH_SERVICE_FILE" <<EOF
+# port_limiter v$VERSION
 [Unit]
 Description=port_limiter auto-refresh (扫描监听端口变化并自动重建)
 After=network-online.target
 
 [Service]
 Type=oneshot
+# 巡检无变化时不产生日志；变更事件写入 /var/log/port_limiter.log
+LogLevelMax=notice
 ExecStart=$SCRIPT_PATH apply
 EOF
     cat > "$REFRESH_TIMER_FILE" <<EOF
+# port_limiter v$VERSION
 [Unit]
 Description=port_limiter 自动巡检定时器（每 ${REFRESH_SEC} 秒）
 
@@ -699,11 +720,10 @@ disable_refresh_timer() {
 # 首次运行把单元装好（幂等；配置未变时巡检本身几乎零开销）
 ensure_units() {
     has_systemd || return 0
-    if [ ! -f "$SERVICE_FILE" ] || { [ "${REFRESH_SEC:-0}" -gt 0 ] && [ ! -f "$REFRESH_TIMER_FILE" ]; }; then
-        deploy_service
-        deploy_refresh_timer
-        systemctl enable port-limiter.service >/dev/null 2>&1
-    fi
+    # 两个单元都由「内容随版本刷新」的幂等写入负责，这里直接调用即可
+    deploy_service
+    deploy_refresh_timer
+    systemctl enable port-limiter.service >/dev/null 2>&1
 }
 
 enable_autostart() {

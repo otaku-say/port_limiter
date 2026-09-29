@@ -436,7 +436,11 @@ apply_all() {
 
     specs="$(mktemp)"; gen_specs > "$specs"
     if [ ! -s "$specs" ]; then
-        warn "rules.conf 为空或端口数超限，本次只清理旧配置"
+        if [ ! -s "$RULE_FILE" ]; then
+            warn "规则文件为空：本次只清理旧配置（请在菜单 1 添加规则）"
+        else
+            warn "没有可用的规则（规则里的端口当前都没在监听 / 类型或格式不合法），本次只保留兜底类；端口上线后巡检会自动建类"
+        fi
     fi
 
     # 配置与上次完全一致时跳过重建：周期性刷新（配合 PORT_SOURCE=listen）才不会

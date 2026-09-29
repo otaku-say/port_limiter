@@ -221,7 +221,7 @@ tc_detect_iface() {
 # ------------------------------------------------------------------ 类规格生成
 # 输出「类号 速率(Mbit) 端口」；类号由出现顺序唯一确定 → 重复执行结果一致（幂等）
 gen_specs() {
-    local f1 f2 f3 f4 f5 line type ports mbps desc p n idx=0 ln=0 cap
+    local f1 f2 f3 f4 f5 line type ports mbps desc p n idx=0 ln=0 cap unit
     while IFS='|' read -r f1 f2 f3 f4 f5; do
         [ -n "${f1:-}" ] || continue
         ln=$((ln + 1))
@@ -233,19 +233,31 @@ EOF
         validate_ports "$ports" || { warn "第 $ln 条：端口表达式非法（$ports），已跳过" >&2; continue; }
         case "$mbps" in ''|*[!0-9]*) warn "第 $ln 条：带宽必须是整数 Mbps，已跳过" >&2; continue;; esac
         [ "$mbps" -ge 1 ] || { warn "第 $ln 条：带宽必须 ≥1，已跳过" >&2; continue; }
-        n="$(count_ports "$ports")"
         cap="$MAX_TC_PORTS"
         [ "$cap" -gt "$HARD_MAX_TC_PORTS" ] && cap="$HARD_MAX_TC_PORTS"
+        if [ "$type" = "3" ]; then
+            # 类型3 走端口范围匹配，成本按「端口段(token)数」算
+            n="$(printf '%s' "$(norm_ports "$ports" | tr ',' ' ')" | wc -w)"
+            unit="个端口段"
+        else
+            # 类型1/2 一类一口，成本按「端口数」算
+            n="$(count_ports "$ports")"
+            unit="个端口"
+        fi
         if [ "$n" -gt "$cap" ]; then
-            warn "第 $ln 条含 $n 个端口，超过上限 $cap —— tc 整形必须「一类一口」，每端口要建 1 个类 + 1 个队列 + 4 条过滤器（入方向再翻倍）；端口数越大构建越慢、内核对象越多，极端情况会把小机器压垮。已跳过该规则，请只列真实服务端口。" >&2
+            warn "第 $ln 条含 $n $unit，超过上限 $cap —— 类型1/2 每端口要建 1 个类 + 1 个队列 + 4 条过滤器（入方向再翻倍），端口数越多构建越慢、内核对象越多，极端情况会把小机器压垮；大范围端口请改用类型3（整段共享额度，支持范围匹配，只需 1 个类 + 1 条过滤器）。已跳过该规则。" >&2
             continue
         fi
         if [ "$type" = "3" ]; then
-            # 类型3 = 整段共享额度 → 共用一个类
+            # 类型3 = 整段共享额度 → 共用一个类。
+            # 这里保留「端口 token」原样下发（含 a-b 范围）：内核 flower 支持范围匹配，
+            # 因此 40001-41111 只需 1 条过滤器，而不是 1111 条（实测已验证）。
             idx=$((idx + 1))
-            for p in $(expand_ports "$ports"); do echo "$idx $mbps $p"; done
+            for tok in $(norm_ports "$ports" | tr ',' ' '); do
+                [ -n "$tok" ] && echo "$idx $mbps $tok"
+            done
         else
-            # 类型1/2 = 每端口独立额度 → 每端口一个类
+            # 类型1/2 = 每端口独立额度 → 每端口一个类（数学决定，无法用范围合并）
             for p in $(expand_ports "$ports"); do idx=$((idx + 1)); echo "$idx $mbps $p"; done
         fi
     done < "$RULE_FILE" | awk '!seen[$3]++'
@@ -266,21 +278,26 @@ tc_qdisc_has() {
 # ------------------------------------------------------------------ 构建一棵整形树
 # $1=设备  $2=匹配关键字 src_port|dst_port  $3=specs 文件
 build_tree() {
-    local dev="$1" kw="$2" specs="$3" idx rate port fam cnt=0
+    local dev="$1" kw="$2" specs="$3" idx rate port fam cnt=0 last_idx=""
     tc_doq tc qdisc del dev "$dev" root                       # 幂等：先清旧的
     tc_do tc qdisc add dev "$dev" root handle 1: htb default "$DEFAULT_CLASS" || return 1
     tc_do tc class add dev "$dev" parent 1: classid "1:$DEFAULT_CLASS" htb rate "$TC_DEFAULT_RATE" ceil "$TC_DEFAULT_RATE" quantum 1500 || return 1
 
     while read -r idx rate port; do
         [ -n "${idx:-}" ] && [ -n "${port:-}" ] && [ -n "${rate:-}" ] || continue
-        cnt=$((cnt + 1))
-        if [ "${DRY_RUN:-0}" != "1" ] && [ $((cnt % 16)) -eq 0 ]; then
-            printf '    已配置 %d 个端口...\n' "$cnt"
+        # 同一个类只建一次「类 + cake」：类型3 的多个端口段共用同一个类，
+        # 重复 tc class add 会因 "Existed" 报错并中止整个 apply
+        if [ "$idx" != "$last_idx" ]; then
+            cnt=$((cnt + 1))
+            if [ "${DRY_RUN:-0}" != "1" ] && [ $((cnt % 16)) -eq 0 ]; then
+                printf '    已配置 %d 个类...\n' "$cnt"
+            fi
+            tc_do tc class add dev "$dev" parent 1: classid "1:$idx" htb rate "${rate}mbit" ceil "${rate}mbit" burst 32k cburst 32k quantum 1500 \
+                || { err "类 $idx（端口/端口段 $port）创建失败"; return 1; }
+            tc_do tc qdisc add dev "$dev" parent "1:$idx" handle "$((idx + 1)):" cake bandwidth "${rate}mbit" $TC_CAKE_OPTS \
+                || warn "$port 的 cake 叶子队列创建失败（退化为纯 HTB 排队）"
+            last_idx="$idx"
         fi
-        tc_do tc class add dev "$dev" parent 1: classid "1:$idx" htb rate "${rate}mbit" ceil "${rate}mbit" burst 32k cburst 32k quantum 1500 \
-            || { err "类 $idx（端口 $port）创建失败"; return 1; }
-        tc_do tc qdisc add dev "$dev" parent "1:$idx" handle "$((idx + 1)):" cake bandwidth "${rate}mbit" $TC_CAKE_OPTS \
-            || warn "端口 $port 的 cake 叶子队列创建失败（退化为纯 HTB 排队）"
         # 双栈：ip 用 prio 1、ipv6 用 prio 2 —— 同一 prio 混用协议族会被内核拒绝
         for fam in ip ipv6; do
             case "$fam" in ip) prio=1 ;; *) prio=2 ;; esac
@@ -731,7 +748,7 @@ interactive() {
         echo "10. 修改整形参数（接口/方向/cake 等）"
         echo " 0. 退出"
         echo "=============================================="
-        read -r -p "请输入菜单数字: " choice
+        read -r -p "请输入菜单数字，或直接输入规则序号删除（如 2）: " choice
         case "$choice" in
             1) menu_add_rule ;;
             2) menu_view_rules ;;

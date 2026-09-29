@@ -1,180 +1,176 @@
 #!/bin/bash
 # ==============================================================================
-#  port_limiter v2.0.0  —— 端口峰值带宽限制管理器
+#  port_limiter v3.0.0  —— 端口峰值带宽整形器（仅 tc 实现）
 # ------------------------------------------------------------------------------
-#  设计目标
-#    1) 只限制「端口峰值带宽」：不限制连接数、不做 per-IP 限制
-#    2) 一次覆盖 TCP + UDP、IPv4 + IPv6（inet 表天然双栈，无需分写两套）
-#    3) 跨发行版：Debian 12+ / Ubuntu 22.04+ / RHEL9 系 / Alpine 等，有 nftables 即可
-#    4) 规则原子下发：生成规则集 → nft -c 语法校验 → nft -f 单事务提交；
-#       任一步失败，现网规则原封不动（v1 是"逐条 nft add"，中间有空窗和半成品）
-#    5) 可观测：每条限速规则都带 counter，能查到「每个端口丢了多少包」
-#    6) 能力自检：按主机 nft/内核能力自动选择实现，老内核自动降级，不写死行为
+#  实现方式：tc HTB（每端口硬上限）+ cake（排队/AQM/每主机公平）
+#    超限的包「排队延后发出」而不是「直接丢弃」，吞吐上限不变，但不再有
+#    TCP 重传风暴，用户侧不会出现「卡几秒→恢复→再卡」的断断续续。
 #
-#  规则文件格式（与 v1 完全兼容）：  id|类型|端口|Mbps|备注
+#  覆盖范围：TCP + UDP、IPv4 + IPv6（flower 同时匹配两个协议族）、双向
+#            - 出方向：出接口上的 HTB+cake，按源端口分类
+#            - 入方向：内核无法直接整形入站，用 ifb 中转（只重定向关心的端口）
+#
+#  依赖：自动检测并用 apt 补齐
+#    - iproute2（tc / ip）、kmod（modprobe）
+#    - 内核模块 sch_htb / sch_cake / cls_flower / act_mirred / ifb
+#      缺失时自动尝试安装 linux-modules-extra-$(uname -r)
+#    - 依赖清单写入 /etc/modules-load.d/port_limiter.conf 保证重启自动加载
+#
+#  规则文件：  类型|端口|Mbps|备注        （序号 = 行号，删除时直接输入序号）
 #    类型 1：离散端口，各自独立限速    例：80,443,8080
 #    类型 2：连续端口，各自独立限速    例：40001-41111
-#    类型 3：连续端口，共享总额度      例：40001-40100
+#    类型 3：连续端口，共享总额度      例：40001-40100（整段共用一个类）
+#
+#  幂等性（重点）：
+#    - 每次 apply 先删除旧 root / ingress qdisc（不存在也不报错），再按
+#      「端口升序 → 类号递增」的固定规则重建；重复执行结果完全一致，不会叠加
+#    - stop 只清理本脚本创建的对象，并尽力还原原有 root qdisc 类型
+#    - 类号/过滤器 prio 由规则列表唯一确定，不随机、不累计
 #
 #  用法：
-#    bash port_limiter.sh              # 交互式菜单
-#    bash port_limiter.sh apply boot   # 开机调用（服务单元使用）
-#    bash port_limiter.sh stop         # 清除全部限速
-#    bash port_limiter.sh check        # 只生成 + 语法校验，不提交（干跑）
-#    bash port_limiter.sh stats [秒]   # 统计：每端口被限速丢弃的流量
-#    bash port_limiter.sh caps         # 本机能力自检
+#    bash port_limiter.sh                # 交互式菜单
+#    bash port_limiter.sh apply boot     # 开机调用（服务单元使用）
+#    bash port_limiter.sh stop           # 清除全部整形并还原
+#    bash port_limiter.sh check          # 干跑：只打印即将执行的 tc 命令，不动现网
+#    bash port_limiter.sh stats [秒]     # 统计：每端口实际通过量 + 排队丢弃
+#    bash port_limiter.sh caps           # 本机能力自检
 #
-#  可调环境变量：
-#    BURST_MS=250            突发额度 ≈ 多少毫秒的数据量（v1 固定为 2000ms 两倍速率）
-#    SET_TIMEOUT=1h          动态集合元素老化时间，0 = 不老化
-#    MAX_EXPLICIT_PORTS=256  降级为逐端口显式规则时的端口数上限
-#    INCLUDE_FORWARD=auto    是否给 forward 链也加规则（auto = 本机开启转发时才加）
-#    TABLE=port_limiter      规则表名（改掉即进入测试模式，不动生产表）
-#    WORK_DIR=/etc/port_limiter
-#
-#  与 v1 的行为差异（升级须知）：
-#    1) burst 由「2 秒数据量」改为「250ms 数据量」，峰值控制更紧；设 BURST_MS=2000 可还原 v1 手感
-#    2) 类型 1（离散端口）由「多口共享一个桶」修正为「每口独立桶」
-#    3) UDP 由「整段共享一桶、无 burst」修正为「按端口独立 + 带 burst」
-#    4) 默认只在本机开启转发时生成 forward 链规则（v1 固定生成，非路由器上是死规则）
+#  可调参数（写入 /etc/port_limiter/config 持久化）：
+#    TC_IFACE=auto           出接口；auto=按默认路由自动识别
+#    TC_DIR=both             整形方向：both 双向 / egress 仅出方向
+#    TC_DEFAULT_RATE=10gbit  兜底类速率（未匹配流量不受限）
+#    TC_CAKE_OPTS="triple-isolate nonat"   cake 参数
+#    MAX_TC_PORTS=64         单条规则端口数上限（整形需要一类一口）
+#    AUTO_INSTALL=1          缺失依赖时自动用 apt 安装
 # ==============================================================================
 set -uo pipefail
 
-VERSION="2.0.0"
-# 路径与表名都支持环境变量覆盖，便于在独立测试表上验证（生产默认值不变）
+VERSION="3.0.0"
 WORK_DIR="${WORK_DIR:-/etc/port_limiter}"
 RULE_FILE="${RULE_FILE:-$WORK_DIR/rules.conf}"
+CONFIG_FILE="${CONFIG_FILE:-$WORK_DIR/config}"
 SCRIPT_PATH="${SCRIPT_PATH:-$WORK_DIR/port_limiter.sh}"
 SERVICE_FILE="${SERVICE_FILE:-/etc/systemd/system/port-limiter.service}"
-TABLE="${TABLE:-port_limiter}"
+STATE_DIR="${STATE_DIR:-/run/port_limiter}"
+TC_STATE="$STATE_DIR/tc.state"
+MODULES_FILE="/etc/modules-load.d/port_limiter.conf"
 
-# 可调参数（可用环境变量覆盖）
-MAX_EXPLICIT_PORTS="${MAX_EXPLICIT_PORTS:-256}"   # 降级为逐端口显式规则的端口上限
-SET_TIMEOUT="${SET_TIMEOUT:-1h}"                  # 动态集合元素老化时间（0 = 不老化）
-BURST_MS="${BURST_MS:-250}"                       # 突发额度 ≈ 多少毫秒的数据量
-INCLUDE_FORWARD="${INCLUDE_FORWARD:-auto}"        # auto|yes|no：是否给 forward 链也加规则
+# 默认参数（config 文件可覆盖）
+TC_IFACE="${TC_IFACE:-auto}"
+TC_DIR="${TC_DIR:-both}"
+TC_DEFAULT_RATE="${TC_DEFAULT_RATE:-10gbit}"
+TC_CAKE_OPTS="${TC_CAKE_OPTS:-triple-isolate nonat}"
+MAX_TC_PORTS="${MAX_TC_PORTS:-64}"
+AUTO_INSTALL="${AUTO_INSTALL:-1}"
+[ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
 
-# ---- 能力开关：probe_caps() 运行时探测填充，决定实现方式 ----
-CAP_INET=0            # 支持 inet 表（双栈）
-CAP_DYNSET=0          # 支持 flags dynamic 动态集合
-CAP_ELEM_LIMIT=0      # 支持「集合元素内嵌 limit」（v1 依赖此特性）
-CAP_ELEM_COUNTER=0    # 支持「元素内嵌 counter」（可统计每端口丢包）
-CAP_SET_TIMEOUT=0     # 集合元素可带 timeout 老化
-IMPL=""               # dynset | explicit  —— 最终选用的实现
+REQ_MODULES="sch_htb sch_cake cls_flower act_mirred ifb"
+DEFAULT_CLASS="ffff"
+IFB_NAME="ifb_pl"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; BLUE='\033[0;34m'; NC='\033[0m'
-
-# ------------------------------------------------------------------ 基础工具
 info() { echo -e "${BLUE}$*${NC}"; }
 ok()   { echo -e "${GREEN}$*${NC}"; }
 warn() { echo -e "${YELLOW}警告：$*${NC}"; }
 err()  { echo -e "${RED}错误：$*${NC}" >&2; }
 
-require_root() {
-    [ "$(id -u)" -eq 0 ] || { err "请用 root 运行（当前 uid=$(id -u)）"; exit 1; }
-}
-
+require_root() { [ "$(id -u)" -eq 0 ] || { err "请用 root 运行（当前 uid=$(id -u)）"; exit 1; }; }
 need_cmd() { command -v "$1" >/dev/null 2>&1; }
 
-# 差异容错：GNU date 与 busybox date 都能拿到秒级时间戳
-now() { date +%s; }
+# ------------------------------------------------------------------ 依赖自动补齐
+APT_UPDATED=0
 
-# ------------------------------------------------------------------ 平台适配
-detect_pkg_mgr() {
+apt_install() {
+    local pkgs="$*"
+    [ -n "$pkgs" ] || return 0
+    if ! need_cmd apt-get; then
+        err "未检测到 apt-get，请手动安装：$pkgs"
+        return 1
+    fi
+    if [ "$APT_UPDATED" = "0" ]; then
+        info "更新软件包索引（apt-get update）..."
+        apt-get update -qq >/dev/null 2>&1 && APT_UPDATED=1
+    fi
+    info "安装缺失依赖：$pkgs"
+    # shellcheck disable=SC2086
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $pkgs >/dev/null 2>&1
+}
+
+load_modules() {
     local m
-    for m in apt-get dnf yum zypper apk pacman; do
-        if need_cmd "$m"; then echo "$m"; return 0; fi
+    for m in $REQ_MODULES; do
+        modprobe "$m" >/dev/null 2>&1
     done
-    echo ""; return 1
+    return 0
 }
 
-# 缺少 nft 时按发行版安装；boot 模式（开机）下不联网安装，直接失败退出
-ensure_nft() {
-    need_cmd nft && return 0
-    local mode="${1:-interactive}"
-    if [ "$mode" = "boot" ]; then
-        err "开机应用时未找到 nft 命令，跳过（请先手动安装 nftables）"
-        return 1
+# 功能探测（真机）：建一张 dummy 网卡，实际挂 htb/cake/flower，测完即删；对现网零影响
+# 返回 0=全部可用  1=不可用  2=无法探测（dummy 不可用，交给真实构建去报错）
+TC_OK=0; TC_CAKE_OK=0; TC_FLOWER_OK=0; IFB_OK=0
+probe_env() {
+    TC_OK=0; TC_CAKE_OK=0; TC_FLOWER_OK=0; IFB_OK=0
+    need_cmd tc || return 1
+    need_cmd ip || return 1
+    modprobe ifb >/dev/null 2>&1
+    if ip link add "_pl_ifbprobe" type ifb >/dev/null 2>&1; then
+        IFB_OK=1; ip link del "_pl_ifbprobe" >/dev/null 2>&1
     fi
-    local pm; pm="$(detect_pkg_mgr)" || true
-    [ -n "$pm" ] || { err "未检测到包管理器，请手动安装 nftables"; return 1; }
-    info "未检测到 nftables，尝试用 $pm 安装..."
-    case "$pm" in
-        apt-get) apt-get update -qq && apt-get install -y -qq nftables ;;
-        dnf)     dnf install -y nftables ;;
-        yum)     yum install -y nftables ;;
-        zypper)  zypper --non-interactive install nftables ;;
-        apk)     apk add --no-cache nftables ;;
-        pacman)  pacman -Sy --noconfirm nftables ;;
-    esac
-    need_cmd nft || { err "nftables 安装失败，请手动处理后重试"; return 1; }
-    ok "nftables 安装完成：$(nft --version 2>/dev/null | head -1)"
+    modprobe dummy >/dev/null 2>&1
+    local dev="_pl_tcprobe" rc=2
+    if ip link add "$dev" type dummy >/dev/null 2>&1; then
+        ip link set "$dev" up >/dev/null 2>&1
+        if tc qdisc add dev "$dev" root handle 1: htb default "$DEFAULT_CLASS" >/dev/null 2>&1; then
+            TC_OK=1; rc=1
+            tc class add dev "$dev" parent 1: classid "1:$DEFAULT_CLASS" htb rate 10gbit ceil 10gbit quantum 1500 >/dev/null 2>&1
+            tc class add dev "$dev" parent 1: classid 1:1 htb rate 100mbit ceil 100mbit quantum 1500 >/dev/null 2>&1
+            tc qdisc add dev "$dev" parent 1:1 handle 2: cake bandwidth 100mbit >/dev/null 2>&1 && { TC_CAKE_OK=1; rc=0; }
+            tc filter add dev "$dev" parent 1: protocol ip prio 1 flower ip_proto tcp src_port 1234 classid 1:1 >/dev/null 2>&1 \
+                && { TC_FLOWER_OK=1; rc=0; }
+        fi
+        tc qdisc del dev "$dev" root >/dev/null 2>&1
+        ip link del "$dev" >/dev/null 2>&1
+    fi
+    return $rc
 }
 
-has_systemd() { need_cmd systemctl && [ -d /run/systemd/system ]; }
-
-# ------------------------------------------------------------------ 能力探测
-# 用「非挂钩的普通链」做真机探测：规则会真正提交给内核（能测出内核级 EOPNOTSUPP），
-# 但普通链没有任何数据包经过，因此对现网零影响；探完立即删除。
-probe_caps() {
-    local t="_pl_probe" rc=0
-    nft delete table inet "$t" 2>/dev/null
-    if nft add table inet "$t" 2>/dev/null; then CAP_INET=1; else
-        err "本机内核不支持 nftables inet 表，无法做双栈统一限速（内核过旧）"
-        return 1
-    fi
-    nft add chain inet "$t" c >/dev/null 2>&1 || { nft delete table inet "$t" 2>/dev/null; return 1; }
-
-    # 1) 动态集合 + 元素内嵌 limit（v1 依赖的特性）
-    if nft add set inet "$t" s1 '{ type inet_service; size 1024; flags dynamic; }' >/dev/null 2>&1; then
-        CAP_DYNSET=1
-        # 1a) 优先探测「limit + counter」：可以拿到每端口丢包统计
-        if nft add rule inet "$t" c tcp dport 40000-40010 update @s1 \
-             '{ tcp dport limit rate over 3750 kbytes/second burst 900 kbytes counter }' >/dev/null 2>&1; then
-            CAP_ELEM_LIMIT=1; CAP_ELEM_COUNTER=1
-        elif nft add rule inet "$t" c tcp dport 40000-40010 update @s1 \
-             '{ tcp dport limit rate over 3750 kbytes/second burst 900 kbytes }' >/dev/null 2>&1; then
-            # 1b) 老版本不支持元素内 counter：仍可限速，只是没有每端口丢包统计
-            CAP_ELEM_LIMIT=1; CAP_ELEM_COUNTER=0
+ensure_deps() {
+    local need=""
+    need_cmd tc       || need="$need iproute2"
+    need_cmd ip       || need="$need iproute2"
+    need_cmd modprobe || need="$need kmod"
+    if [ -n "$need" ]; then
+        if [ "$AUTO_INSTALL" = "1" ]; then
+            apt_install $need || { err "依赖安装失败：$need"; return 1; }
+        else
+            err "缺少命令：$need（AUTO_INSTALL=0 已关闭自动安装）"; return 1
         fi
     fi
-    # 2) 动态集合 + timeout 老化（长跑代理用，避免元素无限堆积）
-    if [ "$CAP_DYNSET" = "1" ] && [ -n "$SET_TIMEOUT" ] && [ "$SET_TIMEOUT" != "0" ]; then
-        if nft add set inet "$t" s2 "{ type inet_service; size 1024; flags dynamic,timeout; timeout $SET_TIMEOUT; }" >/dev/null 2>&1; then
-            CAP_SET_TIMEOUT=1
+
+    load_modules
+    probe_env; local rc=$?
+    if [ "$rc" != "0" ]; then
+        local pkg="linux-modules-extra-$(uname -r)"
+        if [ "$AUTO_INSTALL" = "1" ]; then
+            warn "tc 所需内核模块不可用，尝试安装：$pkg"
+            apt_install "$pkg" || warn "该发行版可能无此包名（例如 Debian 的模块多在 linux-image-* 里）"
+            load_modules; probe_env; rc=$?
+        fi
+        if [ "$rc" = "1" ]; then
+            err "本机 tc 能力不足：需要 sch_htb + sch_cake + cls_flower"
+            echo "  请执行：apt-get install -y iproute2 kmod $pkg" >&2
+            echo "  然后确认：modprobe sch_cake && tc qdisc add dev lo root cake 2>&1（临时验证后可 del）" >&2
+            return 1
         fi
     fi
-    # 3) 规则级 limit（所有版本都支持，作为降级兜底）
-    nft add rule inet "$t" c tcp dport 40000-40010 \
-        limit rate over 3750 kbytes/second burst 900 kbytes counter drop >/dev/null 2>&1 \
-        || { err "连最基础的规则级 limit 都不支持，请升级 nftables"; rc=1; }
 
-    nft delete table inet "$t" 2>/dev/null
-    [ "$rc" -eq 0 ] || return 1
-
-    if [ "$CAP_DYNSET" = "1" ] && [ "$CAP_ELEM_LIMIT" = "1" ]; then
-        IMPL="dynset"      # 首选：单规则 + 每端口独立令牌桶，O(1)，规则数极少
-    else
-        IMPL="explicit"    # 兜底：逐端口显式规则（受 MAX_EXPLICIT_PORTS 限制）
+    # 记录模块清单，保证重启后自动加载（幂等：每次覆盖）
+    if [ -d /etc/modules-load.d ] && [ "${DRY_RUN:-0}" != "1" ]; then
+        printf '%s\n' $REQ_MODULES > "$MODULES_FILE" 2>/dev/null
     fi
     return 0
 }
 
-print_caps() {
-    echo "  发行版     : $( ( . /etc/os-release 2>/dev/null && echo "${PRETTY_NAME:-unknown}" ) || echo unknown )"
-    echo "  内核       : $(uname -r)"
-    echo "  nftables   : $(nft --version 2>/dev/null | head -1)"
-    echo "  inet 表    : $([ "$CAP_INET" = 1 ] && echo 支持 || echo '不支持')"
-    echo "  动态集合   : $([ "$CAP_DYNSET" = 1 ] && echo 支持 || echo '不支持')"
-    echo "  元素级限速 : $([ "$CAP_ELEM_LIMIT" = 1 ] && echo 支持 || echo '不支持')"
-    echo "  每端口丢包统计 : $([ "$CAP_ELEM_COUNTER" = 1 ] && echo 支持 || echo '不支持（改用规则级统计）')"
-    echo "  元素老化   : $([ "$CAP_SET_TIMEOUT" = 1 ] && echo "支持($SET_TIMEOUT)" || echo '不支持')"
-    echo "  init 系统  : $(has_systemd && echo systemd || echo '非 systemd（用 rc.local/local.d 兜底）')"
-    echo "  选用实现   : $IMPL"
-}
-
 # ------------------------------------------------------------------ 端口解析
-# 输入 "80,443,40001-40010" → 逐行输出端口号；非法输入返回非零
 expand_ports() {
     local list part a b p
     list="$(echo "$1" | tr -d ' \t' | tr ',' '\n')"
@@ -201,319 +197,297 @@ EOF
     return 0
 }
 
-norm_ports() { echo "$1" | tr -d ' \t'; }
-count_ports() { expand_ports "$1" 2>/dev/null | grep -c . ; }
+norm_ports()  { echo "$1" | tr -d ' \t'; }
+count_ports() { expand_ports "$1" 2>/dev/null | awk 'END{print NR+0}'; }
 validate_ports() { expand_ports "$1" >/dev/null 2>&1; }
+count_rules() { awk 'END{print NR+0}' "$RULE_FILE" 2>/dev/null; }
 
-# ------------------------------------------------------------------ 速率换算
-mbps_to_kb() { echo $(( $1 * 125 )); }                       # Mbps → KB/s（nft 按 1024 计）
-calc_burst() {                                               # burst ≈ BURST_MS 毫秒的数据量
-    local kb="$1" b
-    b=$(( kb * BURST_MS / 1000 ))
-    [ "$b" -lt 1 ] && b=1
-    echo "$b"
-}
-
-# ------------------------------------------------------------------ 规则集生成
-set_decl() {
-    local name="$1"
-    if [ "$CAP_SET_TIMEOUT" = "1" ]; then
-        printf '\tset %s {\n\t\ttype inet_service\n\t\tsize 65535\n\t\tflags dynamic,timeout\n\t\ttimeout %s\n\t}\n' "$name" "$SET_TIMEOUT"
-    else
-        printf '\tset %s {\n\t\ttype inet_service\n\t\tsize 65535\n\t\tflags dynamic\n\t}\n' "$name"
-    fi
-}
-
-# 单条规则文本：$1=proto $2=dport/sport $3=匹配值 $4=KB/s $5=burst $6=集合名(空=共享桶)
-one_rule() {
-    local proto="$1" kw="$2" match="$3" kb="$4" burst="$5" setn="${6:-}"
-    local cnt=""
-    # 元素内嵌 counter：能统计「每个端口被丢了多少包」，老版本自动省略
-    [ -n "$setn" ] && [ "${CAP_ELEM_COUNTER:-0}" = "1" ] && cnt=" counter"
-    if [ -n "$setn" ]; then
-        # 注意：集合元素的键表达式必须是完整的键（tcp dport / udp sport …），
-        # 只写 dport 会被 nft 当成服务名去解析而报错
-        printf '%s %s %s update @%s { %s %s limit rate over %s kbytes/second burst %s kbytes%s } drop\n' \
-            "$proto" "$kw" "$match" "$setn" "$proto" "$kw" "$kb" "$burst" "$cnt"
-    else
-        printf '%s %s %s limit rate over %s kbytes/second burst %s kbytes counter drop\n' \
-            "$proto" "$kw" "$match" "$kb" "$burst"
-    fi
-}
-
-# 逐端口显式规则（降级实现）：为每个端口各生成 4 条独立规则 → 桶天然独立
-emit_explicit() {
-    local ports="$1" kb="$2" burst="$3" p
-    for p in $(expand_ports "$ports"); do
-        printf '\t\t%s\n' "$(one_rule tcp dport "$p" "$kb" "$burst")"
-        printf '\t\t%s\n' "$(one_rule udp dport "$p" "$kb" "$burst")"
-    done
-}
-
-emit_explicit_out() {
-    local ports="$1" kb="$2" burst="$3" p
-    for p in $(expand_ports "$ports"); do
-        printf '\t\t%s\n' "$(one_rule tcp sport "$p" "$kb" "$burst")"
-        printf '\t\t%s\n' "$(one_rule udp sport "$p" "$kb" "$burst")"
-    done
-}
-
-forward_enabled() {
-    case "${INCLUDE_FORWARD:-auto}" in
-        yes) return 0 ;;
-        no)  return 1 ;;
+# 规则行解析：当前格式「类型|端口|Mbps|备注」
+# 若首列是 8 位以上纯数字（老版本的时间戳 ID），自动忽略该列——一次性迁移，不算兼容负担
+parse_rule_line() {
+    local f1="${1:-}" f2="${2:-}" f3="${3:-}" f4="${4:-}" f5="${5:-}"
+    case "$f1" in
+        [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]*) echo "$f2|$f3|$f4|$f5" ;;
+        *)                                         echo "$f1|$f2|$f3|$f4" ;;
     esac
-    [ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo 0)" = "1" ] && return 0
-    [ "$(cat /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null || echo 0)" = "1" ] && return 0
-    return 1
 }
 
-# 生成完整规则集（stdout）；失败返回非零并给出原因
-gen_ruleset() {
-    local id type ports mbps desc kb burst n
-    local match
-    # 先做一遍输入体检，任何非法行都直接报错，避免下发半套规则
-    if [ ! -s "$RULE_FILE" ]; then
-        echo "# 规则文件为空：仅清空限速表" >&2
-    fi
-    while IFS='|' read -r id type ports mbps desc; do
-        [ -n "${id:-}" ] || continue
-        case "$type" in 1|2|3) ;; *) warn "跳过规则 $id：类型 $type 非法" >&2; continue;; esac
-        if ! validate_ports "$ports"; then
-            warn "跳过规则 $id：端口表达式非法 → $ports" >&2; continue
-        fi
-        case "$mbps" in ''|*[!0-9]*) warn "跳过规则 $id：带宽必须是整数 Mbps → $mbps" >&2; continue;; esac
-        [ "$mbps" -ge 1 ] || { warn "跳过规则 $id：带宽必须 ≥1 Mbps" >&2; continue; }
-    done < "$RULE_FILE"
-
-    # ---------- 表头 ----------
-    if nft list table inet "$TABLE" >/dev/null 2>&1; then
-        echo "flush table inet $TABLE"      # 与后续内容同一事务 → 无放行空窗
-    fi
-    echo "table inet $TABLE {"
-
-    # ---------- 集合（dynset 实现需要，必须先声明后使用）----------
-    if [ "$IMPL" = "dynset" ]; then
-        while IFS='|' read -r id type ports mbps desc; do
-            [ -n "${id:-}" ] || continue
-            case "$type" in 1|2) ;; *) continue;; esac
-            validate_ports "$ports" || continue
-            echo "	# ---- 规则 $id 的令牌桶集合（每端口一个，双向分开）----"
-            set_decl "pl_${id}_tcp_in"
-            set_decl "pl_${id}_tcp_out"
-            set_decl "pl_${id}_udp_in"
-            set_decl "pl_${id}_udp_out"
-        done < "$RULE_FILE"
-    fi
-
-    # ---------- 链 ----------
-    echo "	chain input {"
-    echo "		type filter hook input priority filter; policy accept;"
-    echo "		# 控制面小包放行：纯 ACK/握手包不参与限速，避免把 TCP 掐死"
-    echo "		tcp flags & (fin|syn|rst|ack) == ack meta length < 100 accept"
-    gen_in_rules "input"
-    echo "	}"
-    echo "	chain output {"
-    echo "		type filter hook output priority filter; policy accept;"
-    echo "		tcp flags & (fin|syn|rst|ack) == ack meta length < 100 accept"
-    gen_in_rules "output"
-    echo "	}"
-    if forward_enabled; then
-        echo "	chain forward {"
-        echo "		type filter hook forward priority filter; policy accept;"
-        echo "		tcp flags & (fin|syn|rst|ack) == ack meta length < 100 accept"
-        gen_in_rules "forward"
-        echo "	}"
-    fi
-    echo "}"
-    return 0
+tc_detect_iface() {
+    if [ -n "${TC_IFACE:-}" ] && [ "$TC_IFACE" != "auto" ]; then echo "$TC_IFACE"; return 0; fi
+    ip route show default 2>/dev/null | awk '/^default/{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'
 }
 
-# 生成某条链内的规则；$1 = input|output|forward
-gen_in_rules() {
-    local chain="$1" id type ports mbps desc kb burst match n
-    while IFS='|' read -r id type ports mbps desc; do
-        [ -n "${id:-}" ] || continue
-        case "$type" in 1|2|3) ;; *) continue;; esac
-        validate_ports "$ports" || continue
-        case "$mbps" in ''|*[!0-9]*) continue;; esac
-        kb="$(mbps_to_kb "$mbps")"
-        burst="$(calc_burst "$kb")"
-        match="$(norm_ports "$ports")"
-        echo "		# ---- 规则 $id（类型$type / ${mbps}Mbps / ${desc:-无}）----"
-
-        if [ "$type" = "3" ]; then
-            # 共享额度：整个端口段一个桶
-            [ "$chain" != "output" ] && printf '\t\t%s\n' "$(one_rule tcp dport "$match" "$kb" "$burst")"
-            [ "$chain" != "output" ] && printf '\t\t%s\n' "$(one_rule udp dport "$match" "$kb" "$burst")"
-            [ "$chain" != "input"  ] && printf '\t\t%s\n' "$(one_rule tcp sport "$match" "$kb" "$burst")"
-            [ "$chain" != "input"  ] && printf '\t\t%s\n' "$(one_rule udp sport "$match" "$kb" "$burst")"
+# ------------------------------------------------------------------ 类规格生成
+# 输出「类号 速率(Mbit) 端口」；类号由出现顺序唯一确定 → 重复执行结果一致（幂等）
+gen_specs() {
+    local f1 f2 f3 f4 f5 line type ports mbps desc p n idx=0 ln=0
+    while IFS='|' read -r f1 f2 f3 f4 f5; do
+        [ -n "${f1:-}" ] || continue
+        ln=$((ln + 1))
+        line="$(parse_rule_line "$f1" "$f2" "$f3" "$f4" "$f5")"
+        IFS='|' read -r type ports mbps desc <<EOF
+$line
+EOF
+        case "$type" in 1|2|3) ;; *) warn "第 $ln 条：类型非法（$type），已跳过" >&2; continue;; esac
+        validate_ports "$ports" || { warn "第 $ln 条：端口表达式非法（$ports），已跳过" >&2; continue; }
+        case "$mbps" in ''|*[!0-9]*) warn "第 $ln 条：带宽必须是整数 Mbps，已跳过" >&2; continue;; esac
+        [ "$mbps" -ge 1 ] || { warn "第 $ln 条：带宽必须 ≥1，已跳过" >&2; continue; }
+        n="$(count_ports "$ports")"
+        if [ "$n" -gt "$MAX_TC_PORTS" ]; then
+            warn "第 $ln 条含 $n 个端口，超过 MAX_TC_PORTS=$MAX_TC_PORTS（整形需要一类一口），已跳过" >&2
             continue
         fi
-
-        # 类型 1/2：每端口独立令牌桶
-        if [ "$IMPL" = "dynset" ]; then
-            [ "$chain" != "output" ] && printf '\t\t%s\n' "$(one_rule tcp dport "$match" "$kb" "$burst" "pl_${id}_tcp_in")"
-            [ "$chain" != "output" ] && printf '\t\t%s\n' "$(one_rule udp dport "$match" "$kb" "$burst" "pl_${id}_udp_in")"
-            [ "$chain" != "input"  ] && printf '\t\t%s\n' "$(one_rule tcp sport "$match" "$kb" "$burst" "pl_${id}_tcp_out")"
-            [ "$chain" != "input"  ] && printf '\t\t%s\n' "$(one_rule udp sport "$match" "$kb" "$burst" "pl_${id}_udp_out")"
+        if [ "$type" = "3" ]; then
+            # 类型3 = 整段共享额度 → 共用一个类
+            idx=$((idx + 1))
+            for p in $(expand_ports "$ports"); do echo "$idx $mbps $p"; done
         else
-            n=$(count_ports "$ports")
-            if [ "$n" -gt "$MAX_EXPLICIT_PORTS" ]; then
-                warn "规则 $id 端口数 $n 超过 $MAX_EXPLICIT_PORTS，本机不支持动态集合，退化为「整段共享额度」" >&2
-                [ "$chain" != "output" ] && printf '\t\t%s\n' "$(one_rule tcp dport "$match" "$kb" "$burst")"
-                [ "$chain" != "output" ] && printf '\t\t%s\n' "$(one_rule udp dport "$match" "$kb" "$burst")"
-                [ "$chain" != "input"  ] && printf '\t\t%s\n' "$(one_rule tcp sport "$match" "$kb" "$burst")"
-                [ "$chain" != "input"  ] && printf '\t\t%s\n' "$(one_rule udp sport "$match" "$kb" "$burst")"
-            else
-                [ "$chain" != "output" ] && emit_explicit "$ports" "$kb" "$burst"
-                [ "$chain" != "input"  ] && emit_explicit_out "$ports" "$kb" "$burst"
+            # 类型1/2 = 每端口独立额度 → 每端口一个类
+            for p in $(expand_ports "$ports"); do idx=$((idx + 1)); echo "$idx $mbps $p"; done
+        fi
+    done < "$RULE_FILE" | awk '!seen[$3]++'
+}
+
+tc_do()  { if [ "${DRY_RUN:-0}" = "1" ]; then echo "    $*"; return 0; fi; "$@"; }
+tc_doq() { if [ "${DRY_RUN:-0}" = "1" ]; then echo "    $*   # 允许失败（幂等清理）"; return 0; fi; "$@" 2>/dev/null || true; }
+
+# ------------------------------------------------------------------ 构建一棵整形树
+# $1=设备  $2=匹配关键字 src_port|dst_port  $3=specs 文件
+build_tree() {
+    local dev="$1" kw="$2" specs="$3" idx rate port fam
+    tc_doq tc qdisc del dev "$dev" root                       # 幂等：先清旧的
+    tc_do tc qdisc add dev "$dev" root handle 1: htb default "$DEFAULT_CLASS" || return 1
+    tc_do tc class add dev "$dev" parent 1: classid "1:$DEFAULT_CLASS" htb rate "$TC_DEFAULT_RATE" ceil "$TC_DEFAULT_RATE" quantum 1500 || return 1
+
+    while read -r idx rate port; do
+        [ -n "${idx:-}" ] && [ -n "${port:-}" ] && [ -n "${rate:-}" ] || continue
+        tc_do tc class add dev "$dev" parent 1: classid "1:$idx" htb rate "${rate}mbit" ceil "${rate}mbit" burst 32k cburst 32k quantum 1500 \
+            || { err "类 $idx（端口 $port）创建失败"; return 1; }
+        tc_do tc qdisc add dev "$dev" parent "1:$idx" handle "$((idx + 1)):" cake bandwidth "${rate}mbit" $TC_CAKE_OPTS \
+            || warn "端口 $port 的 cake 叶子队列创建失败（退化为纯 HTB 排队）"
+        # 双栈：ip 用 prio 1、ipv6 用 prio 2 —— 同一 prio 混用协议族会被内核拒绝
+        for fam in ip ipv6; do
+            case "$fam" in ip) prio=1 ;; *) prio=2 ;; esac
+            if ! tc_do tc filter add dev "$dev" parent 1: protocol "$fam" prio "$prio" flower ip_proto tcp "$kw" "$port" classid "1:$idx"; then
+                if [ "$fam" = "ip" ]; then
+                    err "IPv4 TCP 过滤器创建失败（端口 $port，$kw）"; return 1
+                fi
+                warn "IPv6 TCP 过滤器创建失败（端口 $port），该端口仅 IPv4 生效"
             fi
-        fi
-    done < "$RULE_FILE"
+            tc_do tc filter add dev "$dev" parent 1: protocol "$fam" prio "$prio" flower ip_proto udp "$kw" "$port" classid "1:$idx" \
+                || warn "IPv6/UDP 过滤器创建失败（端口 $port，$kw）"
+        done
+    done < "$specs"
     return 0
 }
 
-# 环境变量把表名改掉时，明确提示当前处于测试模式，避免误操作生产表
-warn_if_test_mode() {
-    [ "${TABLE:-port_limiter}" = "port_limiter" ] || \
-        warn "测试模式：本次只操作表 inet $TABLE（生产表 port_limiter 不受影响）"
-}
-
-# ------------------------------------------------------------------ 应用 / 停止
-apply_rules() {
-    local f errf
+# ------------------------------------------------------------------ 应用（幂等）
+apply_all() {
     warn_if_test_mode
-    f="$(mktemp "${TMPDIR:-/tmp}/pl_rules.XXXXXX" 2>/dev/null)" || { err "无法创建临时文件"; return 1; }
-    errf="$(mktemp "${TMPDIR:-/tmp}/pl_err.XXXXXX" 2>/dev/null)" || errf=/dev/null
+    ensure_deps || return 1
+    local iface specs ORIG_ROOT="" IFB_CREATED=0
+    iface="$(tc_detect_iface)"
+    [ -n "$iface" ] || { err "未能识别出接口，请设置 TC_IFACE=eth0"; return 1; }
+    ip link show "$iface" >/dev/null 2>&1 || { err "接口不存在：$iface"; return 1; }
 
-    if ! gen_ruleset >"$f" 2>/tmp/pl_gen_err; then
-        err "规则生成失败，现网规则未做任何改动"
-        sed 's/^/    /' /tmp/pl_gen_err 2>/dev/null
-        rm -f "$f" "$errf"; return 1
+    specs="$(mktemp)"; gen_specs > "$specs"
+    if [ ! -s "$specs" ]; then
+        warn "rules.conf 为空或端口数超限，本次只清理旧配置"
     fi
-    if [ "${DRY_RUN:-0}" = "1" ]; then
-        if [ -s /tmp/pl_gen_err ]; then warn "生成过程中的提示："; sed 's/^/    /' /tmp/pl_gen_err; fi
-        info "===== 干跑（check）：以下规则集只做校验，不会提交 ====="
-        cat "$f"
-        echo
-        if nft -c -f "$f" >"$errf" 2>&1; then
-            ok "语法校验通过（本机实现：$IMPL）"
+
+    info "整形接口：$iface（方向：$TC_DIR）"
+    ORIG_ROOT="$(tc qdisc show dev "$iface" 2>/dev/null | head -1 | awk '{for(i=1;i<=NF;i++) if($i=="qdisc"){print $(i+1); exit}}')"
+    case "$ORIG_ROOT" in htb) ORIG_ROOT="";; esac   # 已是我们的（或别人的）htb，不必还原
+
+    # 1) 出方向（按源端口分类 = 我们的端口发送给客户的流量）
+    build_tree "$iface" src_port "$specs" || { rm -f "$specs"; return 1; }
+
+    # 2) 入方向（ifb 中转；内核不能直接整形入站）
+    if [ "$TC_DIR" = "both" ]; then
+        # 「由本脚本创建」的标记要跨多次 apply 保持，否则二次 apply 后 stop 不敢删 ifb
+        local prev_created=0
+        [ -f "$TC_STATE" ] && prev_created="$(awk -F= '/^IFB_CREATED=/{gsub(/[^0-9]/,"",$2); print $2}' "$TC_STATE" 2>/dev/null)"
+        [ -n "$prev_created" ] || prev_created=0
+        if [ "$IFB_OK" = "1" ]; then
+            if ! ip link show "$IFB_NAME" >/dev/null 2>&1; then
+                ip link add "$IFB_NAME" type ifb >/dev/null 2>&1 && IFB_CREATED=1
+            fi
+            [ "$IFB_CREATED" = "0" ] && IFB_CREATED="$prev_created"
+            if ip link show "$IFB_NAME" >/dev/null 2>&1; then
+                ip link set "$IFB_NAME" up >/dev/null 2>&1
+                tc_doq tc qdisc del dev "$iface" ingress
+                tc_do tc qdisc add dev "$iface" handle ffff: ingress
+                build_tree "$IFB_NAME" dst_port "$specs" || warn "$IFB_NAME 整形树创建失败，入方向未限速"
+                # 只重定向我们关心的端口，其余入站流量走原路径（比全量重定向安全）
+                local redir_ok=0
+                while read -r idx rate port; do
+                    [ -n "${port:-}" ] || continue
+                    for fam in ip ipv6; do
+                        case "$fam" in ip) prio=1 ;; *) prio=2 ;; esac
+                        if tc_do tc filter add dev "$iface" parent ffff: protocol "$fam" prio "$prio" flower ip_proto tcp dst_port "$port" \
+                               action mirred egress redirect dev "$IFB_NAME"; then
+                            redir_ok=$((redir_ok + 1))
+                        fi
+                        tc_do tc filter add dev "$iface" parent ffff: protocol "$fam" prio "$prio" flower ip_proto udp dst_port "$port" \
+                            action mirred egress redirect dev "$IFB_NAME" || true
+                    done
+                done < "$specs"
+                if [ "$redir_ok" -eq 0 ] && [ "${DRY_RUN:-0}" != "1" ]; then
+                    warn "入方向重定向规则一条都没建成功，入方向未限速"
+                fi
+            else
+                warn "无法创建 ifb 设备，入方向未限速（出方向已生效）"
+            fi
         else
-            err "语法校验失败："; sed 's/^/    /' "$errf"
+            warn "本机不支持 ifb，入方向未限速（出方向已生效）；如需双向请安装 ifb 模块"
         fi
-        rm -f "$f" "$errf"; return 0
     fi
 
-    # 提交前先校验：语法/语义有问题的规则绝不会污染现网
-    if ! nft -c -f "$f" >"$errf" 2>&1; then
-        err "规则语法校验失败，现网规则保持原样："
-        sed 's/^/    /' "$errf"
-        rm -f "$f" "$errf"; return 1
-    fi
-    # 单事务提交：要么整套生效，要么完全不变
-    if ! nft -f "$f" >"$errf" 2>&1; then
-        err "规则提交失败，现网规则保持原样："
-        sed 's/^/    /' "$errf"
-        rm -f "$f" "$errf"; return 1
-    fi
-    rm -f "$f" "$errf"
-    ok "限速规则已生效（原子下发，实现方式：$IMPL）"
+    rm -f "$specs"
+    mkdir -p "$STATE_DIR" 2>/dev/null
+    {
+        printf "IFACE='%s'\n" "$iface"
+        printf "IFB='%s'\n" "$(ip link show "$IFB_NAME" >/dev/null 2>&1 && echo "$IFB_NAME")"
+        printf "IFB_CREATED='%s'\n" "$IFB_CREATED"
+        printf "ORIG_ROOT='%s'\n" "$ORIG_ROOT"
+    } > "$TC_STATE" 2>/dev/null
+
+    [ "${DRY_RUN:-0}" != "1" ] && show_brief
     return 0
 }
 
-stop_rules() {
-    if nft list table inet "$TABLE" >/dev/null 2>&1; then
-        if nft delete table inet "$TABLE" 2>/dev/null; then
-            ok "已清除全部限速规则（流量恢复不受限）"
-        else
-            err "清除失败，请手动检查：nft list table inet $TABLE"
-            return 1
+# ------------------------------------------------------------------ 清理（幂等）
+stop_all() {
+    local iface ifb did=0
+    [ -f "$TC_STATE" ] && . "$TC_STATE"
+    iface="${IFACE:-$(tc_detect_iface)}"
+    ifb="${IFB:-}"
+    if [ -n "$iface" ] && ip link show "$iface" >/dev/null 2>&1; then
+        if tc qdisc show dev "$iface" 2>/dev/null | grep -q '^qdisc ingress'; then
+            tc qdisc del dev "$iface" ingress >/dev/null 2>&1 && did=1
         fi
-    else
-        warn "当前没有生效的限速表"
+        if tc qdisc show dev "$iface" 2>/dev/null | grep -q 'qdisc htb 1:'; then
+            tc qdisc del dev "$iface" root >/dev/null 2>&1 && did=1
+            case "${ORIG_ROOT:-}" in
+                fq_codel)   tc qdisc add dev "$iface" root handle 1: fq_codel >/dev/null 2>&1 ;;
+                fq)         tc qdisc add dev "$iface" root handle 1: fq >/dev/null 2>&1 ;;
+                mq)         tc qdisc add dev "$iface" root handle 1: mq >/dev/null 2>&1 ;;
+                pfifo_fast) tc qdisc add dev "$iface" root handle 0: pfifo_fast >/dev/null 2>&1 ;;
+                cake)       tc qdisc add dev "$iface" root cake >/dev/null 2>&1 ;;
+            esac
+        fi
     fi
+    if [ -n "$ifb" ] && ip link show "$ifb" >/dev/null 2>&1; then
+        tc qdisc del dev "$ifb" root >/dev/null 2>&1
+        # 归属判定：状态文件标记为主，设备名等于本脚本命名（ifb_pl）为辅
+        if [ "${IFB_CREATED:-0}" = "1" ] || [ "$ifb" = "$IFB_NAME" ]; then
+            ip link del "$ifb" >/dev/null 2>&1 && did=1
+        fi
+    fi
+    rm -f "$TC_STATE" 2>/dev/null
+    if [ "$did" = "1" ]; then ok "整形配置已清理（并尽力还原原有队列规则）"; else warn "没有发现本脚本创建的整形配置"; fi
     return 0
+}
+
+# ------------------------------------------------------------------ 结构自检
+show_brief() {
+    local iface n_class n_filter
+    [ -f "$TC_STATE" ] && . "$TC_STATE"
+    iface="${IFACE:-}"
+    [ -n "$iface" ] || return 0
+    n_class=$(tc class show dev "$iface" 2>/dev/null | grep -c 'class htb')
+    n_filter=$(tc filter show dev "$iface" parent 1: 2>/dev/null | grep -c 'flower')
+    echo "  出方向 $iface：HTB 类 $n_class 个（含兜底），过滤器 $n_filter 条"
+    if [ -n "${IFB:-}" ] && ip link show "${IFB:-}" >/dev/null 2>&1; then
+        n_class=$(tc class show dev "$IFB" 2>/dev/null | grep -c 'class htb')
+        n_filter=$(tc filter show dev "$IFB" parent 1: 2>/dev/null | grep -c 'flower')
+        echo "  入方向 $IFB：HTB 类 $n_class 个，过滤器 $n_filter 条（按目的端口）"
+    fi
 }
 
 # ------------------------------------------------------------------ 统计
-list_sets() {
-    nft list table inet "$TABLE" 2>/dev/null | sed -n 's/^	set \([A-Za-z0-9_]*\).*/\1/p'
-}
-
-# 元素级计数器（每端口被丢弃的包/字节）——dynset 实现
-elem_counters() {
-    local setname dir
-    for setname in $(list_sets); do
-        case "$setname" in
-            *_in)  dir=in ;;
-            *_out) dir=out ;;
-            *) continue ;;
-        esac
-        nft list set inet "$TABLE" "$setname" 2>/dev/null \
-        | tr -d '\n\t' | sed 's/},/}\n/g' | tr ',' '\n' \
-        | awk -v d="$dir" '
-            {
-              if (match($0, /[0-9]+ limit rate/)) {
-                  port = substr($0, RSTART, RLENGTH); gsub(/ limit rate/, "", port)
-                  if (match($0, /counter packets [0-9]+/)) p = substr($0, RSTART+16, RLENGTH-16); else p = 0
-                  if (match($0, /bytes [0-9]+/)) b = substr($0, RSTART+6, RLENGTH-6); else b = 0
-                  print d"-端口-"port, p, b
-              }
-            }'
+# 输出：tag|类号|字节|包|排队丢弃   （来自 cake 叶子队列，包含实际通过量与丢弃）
+stats_dump() {
+    local dev="$1" tag="$2" specs="$3"
+    tc -s qdisc show dev "$dev" 2>/dev/null | awk -v t="$tag" -v dv="$dev" '
+        /^qdisc / {
+            if ($0 ~ /^qdisc cake/) {
+                par=""
+                for (i=1;i<=NF;i++) if ($i=="parent") par=$(i+1)
+                sub(/^1:/,"",par); cur=par
+            } else {
+                cur=""          # 非 cake（如 htb 根、ingress）的 Sent 行不能算到 cake 头上
+            }
+            next
+        }
+        /Sent [0-9]+ bytes/ {
+            if (cur=="") next
+            line=$0; sub(/.*Sent /,"",line); split(line,a," ")
+            d=0
+            if (match($0,/dropped [0-9]+/)) d=substr($0,RSTART+8,RLENGTH-8)
+            printf "%s|%s|%s|%s|%s|%s\n", t, dv, cur, a[1], a[3], d
+        }' | while IFS='|' read -r t dv idx b p d; do
+        local port rate
+        port="$(awk -v i="$idx" '$1==i{print $3; exit}' "$specs" 2>/dev/null)"
+        rate="$(awk -v i="$idx" '$1==i{print $2; exit}' "$specs" 2>/dev/null)"
+        echo "$t|$dv|$idx|${port:-?}|${rate:-0}|$b|$p|$d"
     done
 }
 
-# 规则级计数器（整条规则匹配到的被丢弃流量）——显式/共享实现
-rule_counters() {
-    nft -a list table inet "$TABLE" 2>/dev/null | tr '\t' ' ' | grep 'counter packets' | grep -v 'update @' \
-    | awk '
-        {
-          label = $1" "$2" "$3
-          if (match($0, /counter packets [0-9]+/)) p = substr($0, RSTART+16, RLENGTH-16); else p = 0
-          if (match($0, /bytes [0-9]+/)) b = substr($0, RSTART+6, RLENGTH-6); else b = 0
-          print "规则-"label, p, b
-        }'
-}
-
 show_stats() {
-    local d="${1:-10}" f1 f2 total
+    local d="${1:-10}" iface specs f1 f2
+    [ -f "$TC_STATE" ] && . "$TC_STATE"
+    iface="${IFACE:-$(tc_detect_iface)}"
+    [ -n "$iface" ] || { err "未能识别出接口"; return 1; }
+    specs="$(mktemp)"; gen_specs > "$specs"
     f1="$(mktemp)"; f2="$(mktemp)"
-    { elem_counters; rule_counters; } | sort > "$f1"
-    info "采样 ${d} 秒（只统计「被限速丢弃」的流量；未被限速的端口不会出现）..."
+
+    { stats_dump "$iface" "出" "$specs"; [ -n "${IFB:-}" ] && stats_dump "${IFB}" "入" "$specs"; } | sort > "$f1"
+    info "采样 ${d} 秒（统计每端口实际通过量；整形模式下超限的包会排队而不是丢包）..."
     sleep "$d"
-    { elem_counters; rule_counters; } | sort > "$f2"
+    { stats_dump "$iface" "出" "$specs"; [ -n "${IFB:-}" ] && stats_dump "${IFB}" "入" "$specs"; } | sort > "$f2"
 
-    total=$(awk '
-        NR==FNR { p[$1]=$2; b[$1]=$3; next }
-        { k=$1; dp=$2-p[k]; db=$3-b[k]; if (dp<0) dp=0; if (db<0) db=0; t+=dp }
-        END { print t+0 }' "$f1" "$f2")
-
-    awk -v d="$d" '
-        NR==FNR { p[$1]=$2; b[$1]=$3; next }
+    awk -F'|' -v d="$d" '
+        NR==FNR { b[$1"|"$2"|"$3]=$6; p[$1"|"$2"|"$3]=$7; dq[$1"|"$2"|"$3]=$8; next }
         {
-          k=$1; dp=$2-p[k]; db=$3-b[k]; if (dp<0) dp=0; if (db<0) db=0
-          if (dp>0 || db>0) printf "%-26s 丢弃速率 %9.2f Mbit/s   丢弃 %8.0f 包/秒\n", k, db*8/1000000/d, dp/d
-        }' "$f1" "$f2" | sort -k3 -nr | head -25
+          k=$1"|"$2"|"$3
+          db=$6-b[k]; dp=$7-p[k]; dd=$8-dq[k]
+          if (db<0) db=0; if (dp<0) dp=0; if (dd<0) dd=0
+          if (db>0 || dp>0 || dd>0)
+              printf "  %-2s %-6s 端口 %-6s 上限 %5s Mbit/s | 通过 %9.2f Mbit/s | %8.0f 包/秒 | 排队丢弃 %8.0f 包/秒\n",
+                     $1, $2, $4, $5, db*8/1000000/d, dp/d, dd/d
+        }' "$f1" "$f2" | sort -k6 -nr | head -30
 
     echo
-    if [ "${total:-0}" = "0" ]; then
-        ok "本次采样窗口内没有任何端口触顶 → 限速未丢弃任何包"
+    if grep -qE '\|[^0]*$' "$f2" 2>/dev/null; then
+        info "说明：整形模式下「排队丢弃」通常很小；若持续偏大说明该端口长期远超上限，建议提高额度"
     else
-        warn "检测到正在被限速丢弃的流量：合计 ${total} 个包（说明有端口达到了峰值上限）"
+        ok "本次采样窗口内所有端口均未触及上限"
     fi
-    rm -f "$f1" "$f2"
+    rm -f "$specs" "$f1" "$f2"
+}
+
+# ------------------------------------------------------------------ 持久配置
+write_config() {
+    mkdir -p "$WORK_DIR" 2>/dev/null
+    {
+        echo "# port_limiter 持久配置（由脚本生成，可手工编辑）"
+        echo "TC_IFACE=\"$TC_IFACE\""
+        echo "TC_DIR=\"$TC_DIR\""
+        echo "TC_DEFAULT_RATE=\"$TC_DEFAULT_RATE\""
+        echo "TC_CAKE_OPTS=\"$TC_CAKE_OPTS\""
+        echo "MAX_TC_PORTS=\"$MAX_TC_PORTS\""
+        echo "AUTO_INSTALL=\"$AUTO_INSTALL\""
+    } > "$CONFIG_FILE" 2>/dev/null
 }
 
 # ------------------------------------------------------------------ 服务 / 自启
 deploy_service() {
-    if has_systemd; then
-        [ -f "$SERVICE_FILE" ] && return 0
+    if has_systemd && [ ! -f "$SERVICE_FILE" ]; then
         cat > "$SERVICE_FILE" <<EOF
 [Unit]
-Description=Port peak bandwidth limiter (port_limiter v$VERSION)
-# 排在发行版自带 nftables.service 之后，避免被它的 flush ruleset 清掉
-After=network-online.target nftables.service
+Description=Port peak bandwidth limiter (port_limiter v$VERSION, tc HTB+cake)
+After=network-online.target
 Wants=network-online.target
 
 [Service]
@@ -529,20 +503,19 @@ EOF
     fi
 }
 
+has_systemd() { need_cmd systemctl && [ -d /run/systemd/system ]; }
+
 enable_autostart() {
     if has_systemd; then
         deploy_service
-        systemctl enable port-limiter.service >/dev/null 2>&1 && ok "已设置开机自启（systemd）" \
-            || { err "systemd 启用失败"; return 1; }
+        systemctl enable port-limiter.service >/dev/null 2>&1 && ok "已设置开机自启（systemd）" || { err "systemd 启用失败"; return 1; }
         return 0
     fi
-    # 非 systemd 兜底：Alpine/OpenRC 用 /etc/local.d，其它用 /etc/rc.local
     if [ -d /etc/local.d ]; then
         printf '#!/bin/sh\n%s apply boot\n' "$SCRIPT_PATH" > /etc/local.d/port_limiter.start
         chmod +x /etc/local.d/port_limiter.start
         rc-update add local default >/dev/null 2>&1
-        ok "已设置开机自启（OpenRC /etc/local.d）"
-        return 0
+        ok "已设置开机自启（OpenRC /etc/local.d）"; return 0
     fi
     local rc=/etc/rc.local
     [ -f "$rc" ] || { printf '#!/bin/sh -e\nexit 0\n' > "$rc"; chmod +x "$rc"; }
@@ -557,10 +530,52 @@ disable_autostart() {
     fi
     rm -f /etc/local.d/port_limiter.start 2>/dev/null
     sed -i "/port_limiter/d" /etc/rc.local 2>/dev/null
-    ok "已取消开机自启（非 systemd 路径）"
+    ok "已取消开机自启"
+}
+
+# ------------------------------------------------------------------ 自我固化
+REMOTE_URL="https://raw.githubusercontent.com/otaku-say/port_limiter/refs/heads/main/port_limiter.sh"
+fixate_self() {
+    local self
+    self="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+    [ "$self" = "$SCRIPT_PATH" ] && return 0
+    mkdir -p "$WORK_DIR"
+    if [ -f "$self" ] && [ -s "$self" ]; then
+        [ -f "$SCRIPT_PATH" ] && ! cmp -s "$self" "$SCRIPT_PATH" 2>/dev/null && \
+            cp -f "$SCRIPT_PATH" "$SCRIPT_PATH.bak.$(date +%s)" 2>/dev/null
+        if cp -f "$self" "$SCRIPT_PATH" 2>/dev/null; then chmod +x "$SCRIPT_PATH"; return 0; fi
+    fi
+    if need_cmd curl && curl -fsSL --max-time 20 "$REMOTE_URL" -o "$SCRIPT_PATH.tmp" 2>/dev/null && [ -s "$SCRIPT_PATH.tmp" ]; then
+        mv -f "$SCRIPT_PATH.tmp" "$SCRIPT_PATH"; chmod +x "$SCRIPT_PATH"; return 0
+    fi
+    warn "脚本自我固化失败（不影响本次运行）"
+}
+
+warn_if_test_mode() {
+    [ "${TC_IFACE:-auto}" = "auto" ] && return 0
+    local d
+    d="$(ip route show default 2>/dev/null | awk '/^default/{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+    [ "$TC_IFACE" != "$d" ] && warn "测试模式：只操作接口 $TC_IFACE（默认路由接口 ${d:-未知} 不受影响）"
+    return 0
 }
 
 # ------------------------------------------------------------------ 规则管理
+# 序号 = 规则文件的行号；删除直接按序号（sed -i），不需要长 ID
+resolve_line() {
+    local input="$1" total
+    case "$input" in ''|*[!0-9]*) return 1;; esac
+    total="$(count_rules)"
+    [ "$input" -ge 1 ] && [ "$input" -le "$total" ] && { echo "$input"; return 0; }
+    return 1
+}
+
+delete_line() {
+    local n="$1"
+    [ -s "$RULE_FILE" ] || return 1
+    sed -i "${n}d" "$RULE_FILE" 2>/dev/null || return 1
+    return 0
+}
+
 menu_add_rule() {
     echo
     info "=== 添加限速规则 ==="
@@ -572,6 +587,7 @@ menu_add_rule() {
 
     read -r -p "端口（支持逗号与范围）: " ports
     validate_ports "$ports" || { err "端口表达式非法：$ports"; return 1; }
+    [ "$(count_ports "$ports")" -le "$MAX_TC_PORTS" ] || { err "端口数超过 MAX_TC_PORTS=$MAX_TC_PORTS（整形需要一类一口），请只列真实服务端口"; return 1; }
 
     read -r -p "峰值带宽（整数 Mbps）: " mbps
     case "$mbps" in ''|*[!0-9]*) err "带宽必须是整数"; return 1;; esac
@@ -581,47 +597,73 @@ menu_add_rule() {
     desc="${desc:-无}"
     case "$desc" in *"|"*) err "备注不能包含竖线 |"; return 1;; esac
 
-    local id; id="$(date +%s)"
-    printf '%s|%s|%s|%s|%s\n' "$id" "$type" "$ports" "$mbps" "$desc" >> "$RULE_FILE"
-    ok "已添加，规则 ID：$id"
-
+    printf '%s|%s|%s|%s\n' "$type" "$ports" "$mbps" "$desc" >> "$RULE_FILE"
+    ok "已添加：第 $(count_rules) 条 → 类型$type / $ports / ${mbps}Mbps"
     read -r -p "立即应用？(Y/n): " a
-    case "${a:-y}" in y|Y|"") apply_rules;; esac
+    case "${a:-y}" in y|Y|"") apply_all;; esac
 }
 
 menu_view_rules() {
     echo
     info "=== 当前规则 ==="
     if [ ! -s "$RULE_FILE" ]; then warn "暂无规则"; return 0; fi
-    awk -F'|' 'BEGIN{printf "%-12s %-6s %-22s %-8s %s\n","ID","类型","端口","Mbps","备注"}
-               {printf "%-12s %-6s %-22s %-8s %s\n",$1,$2,$3,$4,$5}' "$RULE_FILE"
+    awk -F'|' 'BEGIN{printf "%-5s %-6s %-22s %-8s %s\n","序号","类型","端口","Mbps","备注"}
+               {printf "%-5d %-6s %-22s %-8s %s\n", NR,$1,$2,$3,$4}' "$RULE_FILE"
     echo
-    info "类型说明：1 离散端口各自独立 | 2 连续端口各自独立 | 3 连续端口共享额度"
+    info "类型：1 离散端口各自独立 | 2 连续端口各自独立 | 3 连续端口共享额度"
+    info "删除时输入「序号」即可（如输入 2 删除第 2 条）"
 }
 
 menu_del_rule() {
     menu_view_rules
     [ -s "$RULE_FILE" ] || return 0
-    read -r -p "输入要删除的规则 ID: " del_id
-    case "$del_id" in ''|*[!0-9]*) err "ID 必须是数字"; return 1;; esac
-    if grep -q "^${del_id}|" "$RULE_FILE" 2>/dev/null; then
-        grep -v "^${del_id}|" "$RULE_FILE" > "$RULE_FILE.tmp" && mv "$RULE_FILE.tmp" "$RULE_FILE"
-        ok "规则 $del_id 已删除"
+    read -r -p "输入要删除的规则序号: " num
+    resolve_line "$num" >/dev/null || { err "没有这条规则（序号需在 1..$(count_rules) 之间）"; return 1; }
+    if delete_line "$num"; then
+        ok "已删除第 $num 条规则"
         read -r -p "立即重新应用？(Y/n): " a
-        case "${a:-y}" in y|Y|"") apply_rules;; esac
+        case "${a:-y}" in y|Y|"") apply_all;; esac
     else
-        err "未找到规则 ID：$del_id"
+        err "删除失败"
     fi
+}
+
+menu_settings() {
+    echo
+    info "=== 整形参数（写入 $CONFIG_FILE 持久化）==="
+    echo " 1. 出接口          当前：$TC_IFACE"
+    echo " 2. 整形方向        当前：$TC_DIR（both 双向 / egress 仅出方向）"
+    echo " 3. 兜底类速率      当前：$TC_DEFAULT_RATE（未匹配流量不受限）"
+    echo " 4. cake 参数       当前：$TC_CAKE_OPTS"
+    echo " 5. 单规则端口上限  当前：$MAX_TC_PORTS"
+    echo " 6. 自动安装依赖    当前：$AUTO_INSTALL"
+    read -r -p "选择要修改的项（回车返回）: " c
+    case "${c:-}" in
+        1) read -r -p "出接口（auto=自动识别）: " v; [ -n "$v" ] && TC_IFACE="$v" ;;
+        2) read -r -p "整形方向 both|egress: " v; [ -n "$v" ] && TC_DIR="$v" ;;
+        3) read -r -p "兜底类速率（如 10gbit）: " v; [ -n "$v" ] && TC_DEFAULT_RATE="$v" ;;
+        4) read -r -p "cake 参数: " v; [ -n "$v" ] && TC_CAKE_OPTS="$v" ;;
+        5) read -r -p "单规则端口上限: " v; [ -n "$v" ] && MAX_TC_PORTS="$v" ;;
+        6) read -r -p "自动安装依赖 1/0: " v; [ -n "$v" ] && AUTO_INSTALL="$v" ;;
+        "") return 0 ;;
+        *) err "无效选择"; return 1 ;;
+    esac
+    write_config
+    ok "已保存到 $CONFIG_FILE"
 }
 
 menu_status() {
     echo
     info "=== 运行状态 ==="
-    if nft list table inet "$TABLE" >/dev/null 2>&1; then
-        echo "限速表：已加载"
-        nft list table inet "$TABLE" 2>/dev/null | grep -cE 'drop' | awk '{print "限速规则条数："$1}'
+    local iface
+    [ -f "$TC_STATE" ] && . "$TC_STATE"
+    iface="${IFACE:-$(tc_detect_iface)}"
+    echo "出接口：${iface:-未识别}   整形方向：$TC_DIR"
+    if [ -n "$iface" ] && tc qdisc show dev "$iface" 2>/dev/null | grep -q 'qdisc htb 1:'; then
+        echo "整形：已生效"
+        show_brief
     else
-        warn "限速表：未加载（当前不限制任何端口）"
+        warn "整形：未生效（当前不限制任何端口）"
     fi
     if has_systemd; then
         systemctl is-enabled port-limiter.service >/dev/null 2>&1 && echo "开机自启：已启用" || echo "开机自启：未启用"
@@ -630,94 +672,81 @@ menu_status() {
     fi
     echo
     info "=== 本机能力自检 ==="
-    probe_caps && print_caps
-}
-
-# ------------------------------------------------------------------ 自我固化
-REMOTE_URL="https://raw.githubusercontent.com/otaku-say/port_limiter/refs/heads/main/port_limiter.sh"
-
-fixate_self() {
-    local self
-    self="$(readlink -f "$0" 2>/dev/null || echo "$0")"
-    [ "$self" = "$SCRIPT_PATH" ] && return 0
-    mkdir -p "$WORK_DIR"
-    if [ -f "$self" ] && [ -s "$self" ]; then
-        [ -f "$SCRIPT_PATH" ] && ! cmp -s "$self" "$SCRIPT_PATH" 2>/dev/null && \
-            cp -f "$SCRIPT_PATH" "$SCRIPT_PATH.bak.$(date +%s)" 2>/dev/null
-        if cp -f "$self" "$SCRIPT_PATH" 2>/dev/null; then chmod +x "$SCRIPT_PATH"; return 0; fi
-    fi
-    if need_cmd curl && curl -fsSL --max-time 20 "$REMOTE_URL" -o "$SCRIPT_PATH.tmp" 2>/dev/null \
-       && [ -s "$SCRIPT_PATH.tmp" ]; then
-        mv -f "$SCRIPT_PATH.tmp" "$SCRIPT_PATH"; chmod +x "$SCRIPT_PATH"; return 0
-    fi
-    warn "脚本自我固化失败（不影响本次运行）"
-}
-
-# ------------------------------------------------------------------ 入口
-init_env() {
-    require_root
-    mkdir -p "$WORK_DIR"; touch "$RULE_FILE"
-    fixate_self
-    ensure_nft interactive || exit 1
-    probe_caps || exit 1
-    has_systemd && deploy_service
+    echo "  发行版     : $( ( . /etc/os-release 2>/dev/null && echo "${PRETTY_NAME:-unknown}" ) || echo unknown )"
+    echo "  内核       : $(uname -r)"
+    echo "  tc         : $(tc -V 2>/dev/null | head -1)"
+    probe_env >/dev/null 2>&1
+    echo "  sch_htb    : $([ "$TC_OK" = 1 ] && echo 支持 || echo '不支持')"
+    echo "  sch_cake   : $([ "$TC_CAKE_OK" = 1 ] && echo 支持 || echo '不支持')"
+    echo "  cls_flower : $([ "$TC_FLOWER_OK" = 1 ] && echo 支持 || echo '不支持')"
+    echo "  ifb(入方向): $([ "$IFB_OK" = 1 ] && echo 支持 || echo '不支持（入方向将不整形）')"
+    echo "  init 系统  : $(has_systemd && echo systemd || echo '非 systemd')"
 }
 
 interactive() {
-    init_env
-    info "port_limiter v$VERSION 已就绪（实现方式：$IMPL / 双栈 TCP+UDP / 不限连接数）"
+    require_root
+    mkdir -p "$WORK_DIR"; touch "$RULE_FILE"
+    fixate_self
+    ensure_deps || exit 1
+    has_systemd && deploy_service
+    ok "port_limiter v$VERSION 已就绪（tc HTB+cake 整形 / TCP+UDP 双栈 / 不限连接数）"
     while true; do
         echo
         echo "=============================================="
-        echo "   端口峰值带宽管理面板  v$VERSION"
+        echo "   端口峰值带宽管理面板  v$VERSION  [tc 整形]"
         echo "=============================================="
         echo " 1. 添加限速规则"
         echo " 2. 查看当前规则"
         echo " 3. 删除规则"
-        echo " 4. 立即应用 / 重启限速"
-        echo " 5. 停止并移除全部限速"
+        echo " 4. 立即应用 / 重启整形"
+        echo " 5. 停止并移除全部整形"
         echo " 6. 运行状态 + 能力自检"
-        echo " 7. 统计（被限速丢弃的端口/流量）"
+        echo " 7. 统计（每端口通过量 / 排队丢弃）"
         echo " 8. 设置开机自启"
         echo " 9. 取消开机自启"
+        echo "10. 修改整形参数（接口/方向/cake 等）"
         echo " 0. 退出"
         echo "=============================================="
-        read -r -p "请选择: " choice
-        # 直接粘贴 10 位规则 ID 即删除
+        read -r -p "请输入菜单数字，或直接输入规则序号删除（如 2）: " choice
         case "$choice" in
-            [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9])
-                if grep -q "^${choice}|" "$RULE_FILE" 2>/dev/null; then
-                    grep -v "^${choice}|" "$RULE_FILE" > "$RULE_FILE.tmp" && mv "$RULE_FILE.tmp" "$RULE_FILE"
-                    ok "规则 $choice 已删除并重新应用"
-                    apply_rules
-                else
-                    err "未找到规则 ID：$choice"
-                fi
-                ;;
             1) menu_add_rule ;;
             2) menu_view_rules ;;
             3) menu_del_rule ;;
-            4) apply_rules ;;
-            5) stop_rules ;;
+            4) apply_all ;;
+            5) stop_all ;;
             6) menu_status ;;
             7) read -r -p "采样秒数（默认 10）: " s; show_stats "${s:-10}" ;;
             8) enable_autostart ;;
             9) disable_autostart ;;
+            10) menu_settings ;;
             0) ok "再见"; exit 0 ;;
-            *) err "无效输入" ;;
+            *)
+                # 纯数字且非菜单项 → 视为规则序号，快捷删除
+                case "$choice" in
+                    ''|*[!0-9]*) err "无效输入" ;;
+                    *)
+                        if resolve_line "$choice" >/dev/null; then
+                            delete_line "$choice" && { ok "已删除第 $choice 条规则，正在重新应用"; apply_all; } \
+                                                   || err "删除失败"
+                        else
+                            err "未找到序号 $choice（当前共 $(count_rules) 条）"
+                        fi ;;
+                esac ;;
         esac
     done
 }
 
 main() {
     case "${1:-}" in
-        apply)  require_root; ensure_nft "${2:-interactive}" || exit 1; probe_caps || exit 1; apply_rules; exit $? ;;
-        stop)   require_root; stop_rules; exit $? ;;
-        check)  require_root; ensure_nft interactive || exit 1; probe_caps || exit 1; DRY_RUN=1 apply_rules; exit $? ;;
-        stats)  require_root; probe_caps >/dev/null 2>&1; show_stats "${2:-10}"; exit 0 ;;
-        caps)   require_root; probe_caps && print_caps; exit 0 ;;
+        apply)  require_root; apply_all; exit $? ;;
+        stop)   require_root; stop_all; exit $? ;;
+        check)  require_root; DRY_RUN=1 apply_all; exit $? ;;
+        stats)  require_root; show_stats "${2:-10}"; exit $? ;;
+        caps)   require_root; ensure_deps >/dev/null 2>&1; menu_status; exit 0 ;;
         "")     interactive ;;
-        *)      echo "端口峰值带宽限制器 v$VERSION"; echo "用法: $0 [apply boot|stop|check|stats [秒]|caps]"; exit 1 ;;
+        *)      echo "端口峰值带宽整形器 v$VERSION（tc HTB+cake）"
+                echo "用法: $0 [apply boot|stop|check|stats [秒]|caps]"
+                exit 1 ;;
     esac
 }
 

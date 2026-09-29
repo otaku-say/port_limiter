@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==============================================================================
-#  port_limiter v4.0.1  —— 端口峰值带宽整形器（tc HTB + cake）
+#  port_limiter v4.1.0  —— 端口峰值带宽整形器（tc HTB + cake）
 #
 #  ★ 默认工作模式：自动跟踪（auto-tracking）
 #    规则里可以放心写一大段端口（如 40001-41111）：脚本只为「本机真正在监听」的
@@ -28,11 +28,16 @@
 #    类型 2：连续端口，各自独立限速    例：40001-41111
 #    类型 3：连续端口，共享总额度      例：40001-40100（整段共用一个类）
 #
-#  幂等性（重点）：
-#    - 每次 apply 先删除旧 root / ingress qdisc（不存在也不报错），再按
-#      「端口升序 → 类号递增」的固定规则重建；重复执行结果完全一致，不会叠加
+#  幂等与增量（重点）：
+#    - 配置没变 → 什么都不做（一次指纹比对 + 完整性检查）
+#    - 只有端口上下线 → **增量更新**：只增删/改速率那些变化的端口，其它端口的类与
+#      cake 队列一个都不碰 → tc 统计连续（不归零）、无「未整形」空窗，
+#      下发命令数与「变化的端口数」成正比，与总端口数无关
+#    - 结构性变化（接口/方向/cake 参数/兜底速率/ifb 名/端口来源）或 apply force
+#      → 整树重建：先删旧 root / ingress qdisc 再重建，结果完全一致，不会叠加
+#    - 槽位（类号）随状态文件持久保存：端口上下线时沿用旧槽位，类号不会越加越乱；
+#      过滤器 prio 每个单元独占一对，因此能按 prio 精确增删
 #    - stop 只清理本脚本创建的对象，并尽力还原原有 root qdisc 类型
-#    - 类号/过滤器 prio 由规则列表唯一确定，不随机、不累计
 #
 #  用法：
 #    bash port_limiter.sh                # 交互式菜单
@@ -64,7 +69,7 @@
 # ==============================================================================
 set -uo pipefail
 
-VERSION="4.0.1"
+VERSION="4.1.0"
 WORK_DIR="${WORK_DIR:-/etc/port_limiter}"
 RULE_FILE="${RULE_FILE:-$WORK_DIR/rules.conf}"
 CONFIG_FILE="${CONFIG_FILE:-$WORK_DIR/config}"
@@ -253,7 +258,7 @@ local_listen_ports() {
 # ------------------------------------------------------------------ 类规格生成
 # 输出「类号 速率(Mbit) 端口」；类号由出现顺序唯一确定 → 重复执行结果一致（幂等）
 gen_specs() {
-    local type ports mbps desc p n idx=0 ln=0 unit kept_ports kept total_ports
+    local type ports mbps desc p n ln=0 unit kept_ports kept total_ports first
     while IFS='|' read -r type ports mbps desc; do
         [ -n "${type:-}" ] || continue
         ln=$((ln + 1))
@@ -294,22 +299,24 @@ gen_specs() {
             warn "第 $ln 条计划建 $n $unit 个类 —— 每个类要配 1 个队列 + 4 条过滤器（入方向翻倍），内核对象与构建时间随端口数线性增长；请确认符合预期（WARN_CLASSES 可调，0 = 关闭提醒）。" >&2
         fi
         if [ "$type" = "3" ]; then
-            # 类型3 = 整段共享额度 → 共用一个类。
+            # 类型3 = 整段共享额度 → 共用一个桶。
             # 这里保留「端口 token」原样下发（含 a-b 范围）：内核 flower 支持范围匹配，
             # 因此 40001-41111 只需 1 条过滤器，而不是 1111 条（实测已验证）。
-            idx=$((idx + 1))
+            # key 用「#首token」—— 与单端口 key（就是端口号）区分开，且由内容决定，
+            # 与规则顺序、端口增减无关 → 增量更新时槽位可以稳定沿用。
+            first="$(norm_ports "$ports" | tr ',' ' ' | awk '{print $1}')"
             for tok in $(norm_ports "$ports" | tr ',' ' '); do
-                [ -n "$tok" ] && echo "$idx $mbps $tok"
+                [ -n "$tok" ] && echo "#$first $mbps $tok"
             done
         else
-            # 类型1/2 = 每端口独立额度 → 每端口一个类（数学决定，无法用范围合并）
+            # 类型1/2 = 每端口独立额度 → 每端口一个桶（数学决定，无法用范围合并）
             if [ "$kept" -gt 0 ]; then
                 total_ports="$(count_ports "$ports")"
                 [ "$kept" -lt "$total_ports" ] && \
                     info "第 $ln 条：规则写 $total_ports 个端口 → 本机在监听 $kept 个，只为这 $kept 个建类（省 $((total_ports - kept)) 个）" >&2
-                for p in $kept_ports; do idx=$((idx + 1)); echo "$idx $mbps $p"; done
+                for p in $kept_ports; do echo "$p $mbps $p"; done
             else
-                for p in $(expand_ports "$ports"); do idx=$((idx + 1)); echo "$idx $mbps $p"; done
+                for p in $(expand_ports "$ports"); do echo "$p $mbps $p"; done
             fi
         fi
     done < "$RULE_FILE" | awk '!seen[$3]++'
@@ -368,9 +375,91 @@ run_tc_cmds() {
     return 0
 }
 
+# ---------------------------------------------------------------- 单元与槽位（增量更新的基础）
+# 「单元」= 内核里一个桶（1 个 HTB 类 + 1 个 cake 队列 + 若干过滤器）。
+#   类型1/2 的每个端口是一个单元；类型3 的一整段端口共享一个单元。
+# 单元用「内容派生的 key」标识：单端口 key = 端口号；类型3 key = "#首token"。
+#   → 与规则顺序、端口增减无关，是增量更新的前提。
+# 「槽位」slot = 该单元在树里的编号：classid 1:slot、cake handle (slot+1):、
+#   过滤器 prio = slot*2（ip）/ slot*2+1（ipv6）。
+# 槽位随状态文件持久保存：端口集合变化时沿用旧槽位 → 该端口的内核对象不被销毁
+#   → 统计连续、无「未整形」空窗；只有真正新增/删除/改速率的端口才动内核。
+units_from_specs() {
+    awk '
+        { if ($1 in seen) { tok[$1] = tok[$1] "," $3 } else { n++; seen[$1] = 1; order[n] = $1; tok[$1] = $3 } rate[$1] = $2 }
+        END { for (i = 1; i <= n; i++) { k = order[i]; printf "%s %s %s\n", k, rate[k], tok[k] } }' "$1"
+}
+
+# 映射（UNITS，形如 "40000=1;40000;30 #40001-40111=2;40001-40111;20"）取值：
+# $1=key $2=字段号（2=slot 3=tokens 4=rate）
+map_get() {
+    printf '%s\n' ${UNITS:-} | tr ' ' '\n' | awk -F'[=;]' -v k="$1" -v f="$2" 'NF && $1 == k { print $f; exit }'
+}
+map_has() { [ -n "$(map_get "$1" 2)" ]; }
+# 新映射（NEWMAP）包含的 key 列表 / 取值
+new_keys() { printf '%s\n' ${1:-} | tr ' ' '\n' | awk -F'[=;]' 'NF && $1 != "" { printf "%s ", $1 }'; }
+new_slot() { printf '%s\n' ${1:-} | tr ' ' '\n' | awk -F'[=;]' -v k="$2" 'NF && $1 == k { print $2; exit }'; }
+new_rate() { printf '%s\n' ${1:-} | tr ' ' '\n' | awk -F'[=;]' -v k="$2" 'NF && $1 == k { print $4; exit }'; }
+
+# 为本次集合规划槽位：key 与覆盖端口都没变的沿用旧槽位；新增/变动的取「已有最大槽位+1」。
+# 只增不复用 → 同一批里不会出现「新增与删除撞号」。
+plan_units() {
+    local specs="$1" key rate toks slot next=0 out=""
+    for slot in $(printf '%s\n' ${UNITS:-} | tr ' ' '\n' | awk -F'[=;]' 'NF && $1 != "" { print $2 }'); do
+        case "$slot" in ''|*[!0-9]*) continue ;; esac
+        [ "$slot" -gt "$next" ] && next="$slot"
+    done
+    next=$((next + 1))
+    while read -r key rate toks; do
+        [ -n "$key" ] || continue
+        slot="$(map_get "$key" 2)"
+        if [ -z "$slot" ] || [ "$(map_get "$key" 3)" != "$toks" ]; then
+            slot="$next"; next=$((next + 1))
+        fi
+        out="$out$key=$slot;$toks;$rate "
+    done < <(units_from_specs "$specs")
+    printf '%s' "$out"
+}
+
+# 整树重建后把映射压实成 1..N（与 gen_*_cmds 的分配顺序一致）
+rebuild_units_map() {
+    local specs="$1" key rate toks i=0 out=""
+    while read -r key rate toks; do
+        [ -n "$key" ] || continue
+        i=$((i + 1)); out="$out$key=$i;$toks;$rate "
+    done < <(units_from_specs "$specs")
+    UNITS="$out"
+}
+
+# 类存在性判断：交给 tc 自己解析 classid，避免手写十六进制比较出错
+tc_has_class() {
+    local out
+    out="$(tc class show dev "$1" classid "$2" 2>/dev/null)" || return 1
+    case "$out" in *"class htb"*) return 0 ;; *) return 1 ;; esac
+}
+
+# 增量更新前的完整性检查：根 / 兜底类 / 入口链 / ifb 树，以及每个已登记单元的类都还在。
+# 任何一项缺失就返回 1 → 调用方退回整树重建（外部动过 tc 也不会把状态搞乱）。
+validate_tree() {
+    local iface="$1" key slot
+    tc_qdisc_has "$iface" "qdisc htb 1:" || return 1
+    tc_has_class "$iface" "1:$DEFAULT_CLASS" || return 1
+    if [ "$TC_DIR" = "both" ]; then
+        tc_qdisc_has "$iface" "qdisc ingress" || return 1
+        tc_has_class "$IFB_NAME" "1:$DEFAULT_CLASS" || return 1
+    fi
+    for key in $(printf '%s\n' ${UNITS:-} | tr ' ' '\n' | awk -F'[=;]' 'NF && $1 != "" { print $1 }'); do
+        slot="$(map_get "$key" 2)"
+        [ -n "$slot" ] || continue
+        tc_has_class "$iface" "1:$slot" || return 1
+        if [ "$TC_DIR" = "both" ]; then tc_has_class "$IFB_NAME" "1:$slot" || return 1; fi
+    done
+    return 0
+}
+
 # 生成一棵整形树的命令清单；$1=设备 $2=src_port|dst_port $3=specs
 gen_tree_cmds() {
-    local dev="$1" kw="$2" specs="$3" idx rate port fam prio last_idx="" rh
+    local dev="$1" kw="$2" specs="$3" slot=0 key rate toks tok fam prio rh
     rh="$(tc_root_handle "$dev")"
     if [ -z "$rh" ] || [ "$rh" = "0:" ]; then
         # 隐式队列（或尚无可删的 root）：用 replace 直接顶替，不能 del
@@ -380,38 +469,43 @@ gen_tree_cmds() {
         echo "qdisc add dev $dev root handle 1: htb default $DEFAULT_CLASS"
     fi
     echo "class add dev $dev parent 1: classid 1:$DEFAULT_CLASS htb rate $TC_DEFAULT_RATE ceil $TC_DEFAULT_RATE quantum 1500"
-    while read -r idx rate port; do
-        [ -n "${idx:-}" ] && [ -n "${port:-}" ] && [ -n "${rate:-}" ] || continue
-        # 同一个类只建一次「类 + cake」：类型3 的多个端口段共用同一个类，
-        # 重复 class add 会因 Existed 失败并中断整批
-        if [ "$idx" != "$last_idx" ]; then
-            echo "class add dev $dev parent 1: classid 1:$idx htb rate ${rate}mbit ceil ${rate}mbit burst 32k cburst 32k quantum 1500"
-            echo "qdisc add dev $dev parent 1:$idx handle $((idx + 1)): cake bandwidth ${rate}mbit $TC_CAKE_OPTS"
-            last_idx="$idx"
-        fi
-        # 双栈：ip 用 prio 1、ipv6 用 prio 2（同一 prio 混协议族会被内核拒绝）
-        for fam in ip ipv6; do
-            case "$fam" in ip) prio=1 ;; *) prio=2 ;; esac
-            echo "filter add dev $dev parent 1: protocol $fam prio $prio flower ip_proto tcp $kw $port classid 1:$idx"
-            echo "filter add dev $dev parent 1: protocol $fam prio $prio flower ip_proto udp $kw $port classid 1:$idx"
+    # 每个单元一个槽位（第 1 个 = 1、第 2 个 = 2 …），与 rebuild_units_map 的分配一致
+    while read -r key rate toks; do
+        [ -n "$key" ] || continue
+        slot=$((slot + 1))
+        echo "class add dev $dev parent 1: classid 1:$slot htb rate ${rate}mbit ceil ${rate}mbit burst 32k cburst 32k quantum 1500"
+        echo "qdisc add dev $dev parent 1:$slot handle $((slot + 1)): cake bandwidth ${rate}mbit $TC_CAKE_OPTS"
+        # 双栈：同一 prio 混协议族会被内核拒绝。每个单元独占一对 prio，
+        # 于是「按 prio 删除」能精确删掉某个单元的过滤器 —— 这是增量更新的前提
+        for tok in $(printf '%s' "$toks" | tr ',' ' '); do
+            for fam in ip ipv6; do
+                case "$fam" in ip) prio=$((slot * 2)) ;; *) prio=$((slot * 2 + 1)) ;; esac
+                echo "filter add dev $dev parent 1: protocol $fam prio $prio flower ip_proto tcp $kw $tok classid 1:$slot"
+                echo "filter add dev $dev parent 1: protocol $fam prio $prio flower ip_proto udp $kw $tok classid 1:$slot"
+            done
         done
-    done < "$specs"
+    done < <(units_from_specs "$specs")
     return 0
 }
 
 # 生成入方向重定向清单；$1=物理接口 $2=specs（只重定向我们关心的端口）
+# prio 必须与 gen_tree_cmds 的槽位编号一致，这样才能按 prio 精确增删
 gen_ingress_cmds() {
-    local dev="$1" specs="$2" idx rate port fam prio
+    local dev="$1" specs="$2" map="${3:-}" i=0 key rate toks tok fam prio slot
     tc_qdisc_has "$dev" "qdisc ingress" && echo "qdisc del dev $dev ingress"
     echo "qdisc add dev $dev handle ffff: ingress"
-    while read -r idx rate port; do
-        [ -n "${port:-}" ] || continue
-        for fam in ip ipv6; do
-            case "$fam" in ip) prio=1 ;; *) prio=2 ;; esac
-            echo "filter add dev $dev parent ffff: protocol $fam prio $prio flower ip_proto tcp dst_port $port action mirred egress redirect dev $IFB_NAME"
-            echo "filter add dev $dev parent ffff: protocol $fam prio $prio flower ip_proto udp dst_port $port action mirred egress redirect dev $IFB_NAME"
+    while read -r key rate toks; do
+        [ -n "$key" ] || continue
+        i=$((i + 1))
+        slot="$(new_slot "$map" "$key")"; [ -n "$slot" ] || slot="$i"
+        for tok in $(printf '%s' "$toks" | tr ',' ' '); do
+            for fam in ip ipv6; do
+                case "$fam" in ip) prio=$((slot * 2)) ;; *) prio=$((slot * 2 + 1)) ;; esac
+                echo "filter add dev $dev parent ffff: protocol $fam prio $prio flower ip_proto tcp dst_port $tok action mirred egress redirect dev $IFB_NAME"
+                echo "filter add dev $dev parent ffff: protocol $fam prio $prio flower ip_proto udp dst_port $tok action mirred egress redirect dev $IFB_NAME"
+            done
         done
-    done < "$specs"
+    done < <(units_from_specs "$specs")
     return 0
 }
 
@@ -423,6 +517,80 @@ apply_tree() {
         [ "${DRY_RUN:-0}" != "1" ] && tc qdisc del dev "$dev" root >/dev/null 2>&1
         return 1
     fi
+    return 0
+}
+
+# ---------------------------------------------------------------- 增量下发
+# 只动「新增 / 删除 / 速率变化」的单元，其余内核对象一个都不碰：
+#   - 未变化端口的类与 cake 队列保持原样 → tc 统计连续（Sent/丢弃不归零）
+#   - 不删根 qdisc → 没有「未整形」窗口
+#   - 命令数只与「本次变化的端口数」成正比，与总端口数无关
+# $1=设备 $2=端口关键字 $3=specs $4=新映射(NEWMAP)
+gen_delta_tree() {
+    local dev="$1" kw="$2" specs="$3" map="$4" key rate toks slot fam prio tok nslot nrate
+    # 1) 先删：旧映射里「已不需要」或「槽位变了」的单元（先删后加，避免撞号）
+    for key in $(printf '%s\n' ${UNITS:-} | tr ' ' '\n' | awk -F'[=;]' 'NF && $1 != "" { print $1 }'); do
+        slot="$(map_get "$key" 2)"; [ -n "$slot" ] || continue
+        nslot="$(new_slot "$map" "$key")"
+        [ -n "$nslot" ] && [ "$nslot" = "$slot" ] && continue      # 原槽位保留 → 内核对象不动
+        for fam in ip ipv6; do
+            case "$fam" in ip) prio=$((slot * 2)) ;; *) prio=$((slot * 2 + 1)) ;; esac
+            echo "filter del dev $dev parent 1: protocol $fam prio $prio"
+        done
+        echo "class del dev $dev parent 1: classid 1:$slot"
+    done
+    # 2) 再加：新单元建「类 + cake + 过滤器」；槽位沿用但速率变了的只改速率
+    while read -r key rate toks; do
+        [ -n "$key" ] || continue
+        nslot="$(new_slot "$map" "$key")"; nrate="$(new_rate "$map" "$key")"
+        [ -n "$nrate" ] || nrate="$rate"
+        slot="$(map_get "$key" 2)"
+        if [ "$slot" = "$nslot" ]; then
+            # 槽位沿用：只有速率变了才动（class change + qdisc change 都不会重置统计）
+            [ "$(map_get "$key" 4)" = "$nrate" ] && continue
+            echo "class change dev $dev parent 1: classid 1:$nslot htb rate ${nrate}mbit ceil ${nrate}mbit burst 32k cburst 32k quantum 1500"
+            echo "qdisc change dev $dev parent 1:$nslot handle $((nslot + 1)): cake bandwidth ${nrate}mbit $TC_CAKE_OPTS"
+        else
+            # 新建（含槽位迁移：旧对象已在上面删掉）
+            echo "class add dev $dev parent 1: classid 1:$nslot htb rate ${nrate}mbit ceil ${nrate}mbit burst 32k cburst 32k quantum 1500"
+            echo "qdisc add dev $dev parent 1:$nslot handle $((nslot + 1)): cake bandwidth ${nrate}mbit $TC_CAKE_OPTS"
+            for tok in $(printf '%s' "$toks" | tr ',' ' '); do
+                for fam in ip ipv6; do
+                    case "$fam" in ip) prio=$((nslot * 2)) ;; *) prio=$((nslot * 2 + 1)) ;; esac
+                    echo "filter add dev $dev parent 1: protocol $fam prio $prio flower ip_proto tcp $kw $tok classid 1:$nslot"
+                    echo "filter add dev $dev parent 1: protocol $fam prio $prio flower ip_proto udp $kw $tok classid 1:$nslot"
+                done
+            done
+        fi
+    done < <(units_from_specs "$specs")
+    return 0
+}
+
+# 入方向重定向（物理接口 ingress 链）的增量：只增删变化的端口
+# $1=物理接口 $2=specs $3=新映射
+gen_delta_redirect() {
+    local dev="$1" specs="$2" map="$3" key rate toks slot tok fam prio nslot
+    for key in $(printf '%s\n' ${UNITS:-} | tr ' ' '\n' | awk -F'[=;]' 'NF && $1 != "" { print $1 }'); do
+        slot="$(map_get "$key" 2)"; toks="$(map_get "$key" 3)"; [ -n "$slot" ] || continue
+        nslot="$(new_slot "$map" "$key")"
+        [ -n "$nslot" ] && [ "$nslot" = "$slot" ] && continue
+        for fam in ip ipv6; do
+            case "$fam" in ip) prio=$((slot * 2)) ;; *) prio=$((slot * 2 + 1)) ;; esac
+            echo "filter del dev $dev parent ffff: protocol $fam prio $prio"
+        done
+    done
+    while read -r key rate toks; do
+        [ -n "$key" ] || continue
+        nslot="$(new_slot "$map" "$key")"
+        [ "$(map_get "$key" 2)" = "$nslot" ] && continue      # 已存在且槽位未变 → 重定向无需变动
+        for tok in $(printf '%s' "$toks" | tr ',' ' '); do
+            for fam in ip ipv6; do
+                case "$fam" in ip) prio=$((nslot * 2)) ;; *) prio=$((nslot * 2 + 1)) ;; esac
+                echo "filter add dev $dev parent ffff: protocol $fam prio $prio flower ip_proto tcp dst_port $tok action mirred egress redirect dev $IFB_NAME"
+                echo "filter add dev $dev parent ffff: protocol $fam prio $prio flower ip_proto udp dst_port $tok action mirred egress redirect dev $IFB_NAME"
+            done
+        done
+    done < <(units_from_specs "$specs")
     return 0
 }
 
@@ -438,24 +606,35 @@ apply_all() {
 
     gen_err="$(mktemp)"
     specs="$(mktemp)"; gen_specs > "$specs" 2>"$gen_err"
-    # 配置与上次完全一致时跳过重建：周期性刷新（配合 PORT_SOURCE=listen）才不会
-    # 反复销毁重建 —— 每次重建都会清空统计、并有极短的未整形窗口。
-    # 巡检路径（QUICK=quick）全程安静：否则每 30 秒刷一条日志，一天几千行。
-    local sig stored
-    sig="$( { cat "$specs"; echo "$iface|$TC_DIR|$TC_CAKE_OPTS|$TC_DEFAULT_RATE|$IFB_NAME|$PORT_SOURCE"; } | md5sum | cut -d' ' -f1)"
-    stored="$(sed -n "s/^SIG='\([^']*\)'.*/\1/p" "$TC_STATE" 2>/dev/null | head -1)"
-    if [ "${FORCE:-0}" != "1" ] && [ -n "$stored" ] && [ "$sig" = "$stored" ] && tc_qdisc_has "$iface" "qdisc htb 1:"; then
-        # 只有「非交互」场景（systemd 定时器）才静默；人工执行要能看到反馈
-        if [ -t 1 ]; then ok "配置与上次一致，跳过重建（如需强制重建：bash $0 apply force）"; fi
+    # 两级指纹：
+    #   STATIC_SIG = 接口/方向/cake 参数/兜底速率/ifb 名/端口来源 → 变了只能整树重建
+    #   UNITS_SIG  = 单元集合（端口 + 速率）→ 变了走增量更新，只动变化的那几个端口
+    local static_sig units_sig stored_static stored_units need_full=0 mode=""
+    static_sig="$(echo "$iface|$TC_DIR|$TC_CAKE_OPTS|$TC_DEFAULT_RATE|$IFB_NAME|$PORT_SOURCE" | md5sum | cut -d' ' -f1)"
+    units_sig="$(units_from_specs "$specs" | md5sum | cut -d' ' -f1)"
+    stored_static="$(sed -n "s/^STATIC_SIG='\([^']*\)'.*/\1/p" "$TC_STATE" 2>/dev/null | head -1)"
+    stored_units="$(sed -n "s/^UNITS_SIG='\([^']*\)'.*/\1/p" "$TC_STATE" 2>/dev/null | head -1)"
+    [ "${FORCE:-0}" = "1" ] && need_full=1
+    [ -z "$stored_static" ] && need_full=1
+    if [ -n "$stored_static" ] && [ "$static_sig" != "$stored_static" ]; then need_full=1; fi
+    if [ "$need_full" = "0" ] && ! validate_tree "$iface"; then
+        need_full=1
+        warn "整形树不完整（被外部改动过或残留），本次整树重建"
+    fi
+    # 完全没变化 → 直接返回（巡检路径保持安静，人工执行给一句反馈）
+    if [ "$need_full" = "0" ] && [ "$units_sig" = "$stored_units" ]; then
+        if [ -t 1 ]; then ok "配置与上次一致，未做任何改动（如需强制重建：bash $0 apply force）"; fi
         rm -f "$specs" "$gen_err"; return 0
     fi
+    [ "$need_full" = "1" ] && mode="整树重建" || mode="增量更新"
 
-    # 确实要重建了，这时才把生成阶段的告警打出来（巡检无变化时不再刷屏）
+    # 确实要动了，这时才把生成阶段的告警打出来（巡检无变化时不再刷屏）
     [ -s "$gen_err" ] && sed 's/^/  /' "$gen_err" >&2
-    # 每次重建都记一条事件（谁触发都记：巡检自动 / 人工 / 开机）
+    # 每次改动都记一条事件（谁触发都记：巡检自动 / 人工 / 开机）
     if [ "${DRY_RUN:-0}" != "1" ]; then
-        printf '%s 重建 | 接口=%s | 类数=%s | 端口: %s\n' \
-            "$(date '+%F %T')" "$iface" "$(awk 'END{print NR+0}' "$specs" 2>/dev/null)" \
+        printf '%s %s | 接口=%s | 桶数=%s | 端口: %s\n' \
+            "$(date '+%F %T')" "$mode" "$iface" \
+            "$(units_from_specs "$specs" | awk 'END{print NR+0}')" \
             "$(awk '{printf "%s ", $3}' "$specs" 2>/dev/null)" >> "$EVENT_LOG" 2>/dev/null
     fi
     if [ ! -s "$specs" ]; then
@@ -470,10 +649,21 @@ apply_all() {
     ORIG_ROOT="$(tc qdisc show dev "$iface" 2>/dev/null | head -1 | awk '{for(i=1;i<=NF;i++) if($i=="qdisc"){print $(i+1); exit}}')"
     case "$ORIG_ROOT" in htb) ORIG_ROOT="";; esac   # 已是我们的（或别人的）htb，不必还原
 
-    # 1) 出方向（按源端口分类 = 我们的端口发送给客户的流量）
-    apply_tree "$iface" src_port "$specs" || { rm -f "$specs" "$gen_err"; return 1; }
+    NEWMAP=""
+    if [ "$need_full" = "1" ]; then
+        # ---- 整树重建（结构变了 / 状态缺失 / 树被破坏 / force）----
+        apply_tree "$iface" src_port "$specs" || { rm -f "$specs" "$gen_err"; return 1; }
+    else
+        # ---- 增量更新：只动变化的端口，其余端口的类与统计原样保留 ----
+        NEWMAP="$(plan_units "$specs")"
+        if ! gen_delta_tree "$iface" src_port "$specs" "$NEWMAP" | run_tc_cmds; then
+            warn "出方向增量下发失败，改为整树重建"
+            apply_tree "$iface" src_port "$specs" || { rm -f "$specs" "$gen_err"; return 1; }
+            need_full=1
+        fi
+    fi
 
-    # 2) 入方向（ifb 中转；内核不能直接整形入站）
+    # 入方向（ifb 中转；内核不能直接整形入站）
     if [ "$TC_DIR" = "both" ]; then
         # 「由本脚本创建」的标记要跨多次 apply 保持，否则二次 apply 后 stop 不敢删 ifb
         local prev_created=0
@@ -486,10 +676,22 @@ apply_all() {
             [ "$IFB_CREATED" = "0" ] && IFB_CREATED="$prev_created"
             if ip link show "$IFB_NAME" >/dev/null 2>&1; then
                 ip link set "$IFB_NAME" up >/dev/null 2>&1
-                # 先把 ifb 上的整形树建好，再把入站流量引流进去（避免短暂引到未配置的 ifb）
-                apply_tree "$IFB_NAME" dst_port "$specs" || warn "$IFB_NAME 整形树创建失败，入方向未限速"
-                if ! gen_ingress_cmds "$iface" "$specs" | run_tc_cmds; then
-                    warn "入方向重定向下发失败，入方向未限速"
+                if [ "$need_full" = "1" ]; then
+                    # 先把 ifb 上的整形树建好，再把入站流量引流进去（避免短暂引到未配置的 ifb）
+                    apply_tree "$IFB_NAME" dst_port "$specs" || warn "$IFB_NAME 整形树创建失败，入方向未限速"
+                    if ! gen_ingress_cmds "$iface" "$specs" | run_tc_cmds; then
+                        warn "入方向重定向下发失败，入方向未限速"
+                    fi
+                else
+                    # 增量：ifb 内的类/过滤器 + 物理接口上的重定向，都只动变化的端口
+                    if ! gen_delta_tree "$IFB_NAME" dst_port "$specs" "$NEWMAP" | run_tc_cmds; then
+                        warn "入方向增量下发失败，改为重建入方向"
+                        apply_tree "$IFB_NAME" dst_port "$specs" || warn "$IFB_NAME 整形树创建失败，入方向未限速"
+                        gen_ingress_cmds "$iface" "$specs" | run_tc_cmds || warn "入方向重定向下发失败，入方向未限速"
+                    elif ! gen_delta_redirect "$iface" "$specs" "$NEWMAP" | run_tc_cmds; then
+                        warn "入方向重定向增量失败，改为重建入口链"
+                        gen_ingress_cmds "$iface" "$specs" | run_tc_cmds || warn "入方向重定向下发失败，入方向未限速"
+                    fi
                 fi
             else
                 warn "无法创建 ifb 设备，入方向未限速（出方向已生效）"
@@ -499,6 +701,9 @@ apply_all() {
         fi
     fi
 
+    # 更新槽位映射：整树重建 → 压实为 1..N；增量 → 采用本次规划的新映射
+    if [ "$need_full" = "1" ]; then rebuild_units_map "$specs"; else UNITS="$NEWMAP"; fi
+
     rm -f "$specs" "$gen_err"
     mkdir -p "$STATE_DIR" 2>/dev/null
     {
@@ -506,7 +711,9 @@ apply_all() {
         printf "IFB='%s'\n" "$(ip link show "$IFB_NAME" >/dev/null 2>&1 && echo "$IFB_NAME")"
         printf "IFB_CREATED='%s'\n" "$IFB_CREATED"
         printf "ORIG_ROOT='%s'\n" "$ORIG_ROOT"
-        printf "SIG='%s'\n" "$sig"
+        printf "STATIC_SIG='%s'\n" "$static_sig"
+        printf "UNITS_SIG='%s'\n" "$units_sig"
+        printf "UNITS='%s'\n" "$UNITS"
         printf "CAPS_OK='%s'\n" "${CAPS_OK:-0}"
         printf "IFB_OK='%s'\n" "${IFB_OK:-0}"
     } > "$TC_STATE" 2>/dev/null
@@ -587,8 +794,9 @@ stats_dump() {
             printf "%s|%s|%s|%s|%s|%s\n", t, dv, cur, a[1], a[3], d
         }' | while IFS='|' read -r t dv idx b p d; do
         local port rate
-        port="$(awk -v i="$idx" '$1==i{print $3; exit}' "$specs" 2>/dev/null)"
-        rate="$(awk -v i="$idx" '$1==i{print $2; exit}' "$specs" 2>/dev/null)"
+        # cake 的 parent 是 1:<槽位> → 从状态文件的 UNITS 映射反查端口与速率
+        port="$(printf '%s\n' ${UNITS:-} | tr ' ' '\n' | awk -F'[=;]' -v s="$idx" 'NF && $2 == s { sub(/,.*/, "", $3); print $3; exit }')"
+        rate="$(printf '%s\n' ${UNITS:-} | tr ' ' '\n' | awk -F'[=;]' -v s="$idx" 'NF && $2 == s { print $4; exit }')"
         echo "$t|$dv|$idx|${port:-?}|${rate:-0}|$b|$p|$d"
     done
 }
